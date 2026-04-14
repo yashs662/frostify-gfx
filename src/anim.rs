@@ -1,11 +1,17 @@
-//! Scalar animation primitives.
+//! Animation primitives — generic over `Lerp`.
 //!
-//! Stage-1 scope: tween `Signal<f32>` values over a timeline. Curves
+//! Stage-1 scope: tween any `Signal<T: Lerp>` over a timeline. Curves
 //! cover the four shapes a real UI app needs — linear, ease-in-out,
-//! cubic-bezier (css-style timing), and a 1-DOF damped spring. Vector
-//! quantities (colors, positions) are driven by derivation: the app
-//! reads the scalar inside a refresh closure and pushes the derived
-//! value through the tracked setter.
+//! cubic-bezier (css-style timing), and a 1-DOF damped spring. The
+//! `Lerp` impls cover scalars (`f32`), 2-vectors (`[f32; 2]`) and rgba
+//! colors (`[f32; 4]`); add more as the type set grows.
+//!
+//! Vector tweens go through the same code path as scalar tweens — the
+//! curve produces a normalized 0..1 progress and `Lerp::lerp` does the
+//! per-component interpolation. The timeline stores tweens behind a
+//! trait object (`Box<dyn TweenDyn>`) so the same `Vec` can hold mixed
+//! types; tween counts are small (low dozens), so the indirection
+//! is cheap. Upgrade to a `SmallVec` is a stage-2 concern.
 //!
 //! The timeline does not touch winit or the tree. It exposes
 //! `tick(now)` which returns a `TickResult` containing `updated` (any
@@ -28,6 +34,38 @@
 use std::time::{Duration, Instant};
 
 use crate::signal::Signal;
+
+/// Linear interpolation trait. All tweenable types must impl this.
+///
+/// `lerp(self, to, t)` returns `self * (1 - t) + to * t`. `t` is
+/// expected in `[0, 1]` but implementations should not panic outside
+/// that range — extrapolation is fine.
+pub trait Lerp: Copy + PartialEq + 'static {
+    fn lerp(self, to: Self, t: f32) -> Self;
+}
+
+impl Lerp for f32 {
+    fn lerp(self, to: Self, t: f32) -> Self {
+        self + (to - self) * t
+    }
+}
+
+impl Lerp for [f32; 2] {
+    fn lerp(self, to: Self, t: f32) -> Self {
+        [self[0].lerp(to[0], t), self[1].lerp(to[1], t)]
+    }
+}
+
+impl Lerp for [f32; 4] {
+    fn lerp(self, to: Self, t: f32) -> Self {
+        [
+            self[0].lerp(to[0], t),
+            self[1].lerp(to[1], t),
+            self[2].lerp(to[2], t),
+            self[3].lerp(to[3], t),
+        ]
+    }
+}
 
 /// Easing curves. All stored by value — `Copy`.
 ///
@@ -135,43 +173,73 @@ fn spring_eval(k: f32, c: f32, t: f32) -> (f32, f32) {
     }
 }
 
-/// One in-flight tween. Owned by a `Timeline`.
+/// Evaluate a curve at the elapsed time of a tween. Returns
+/// `(progress, done)` where `progress` is normalized 0..1 (or settled
+/// at 1.0 for spring). Centralized so scalar and vector tweens share
+/// the same path.
+fn eval_progress(curve: Curve, start: Instant, duration: Duration, now: Instant) -> (f32, bool) {
+    let elapsed = now.saturating_duration_since(start);
+    match curve {
+        Curve::Spring { stiffness, damping } => {
+            let t = elapsed.as_secs_f32();
+            let (x, vel) = spring_eval(stiffness, damping, t);
+            let settled = (x - 1.0).abs() < 1e-3 && vel.abs() < 1e-3;
+            (x, settled || elapsed >= duration)
+        }
+        _ => {
+            let total = duration.as_secs_f32().max(1e-6);
+            let t_norm = elapsed.as_secs_f32() / total;
+            let done = t_norm >= 1.0;
+            let eased = curve.eval(t_norm.clamp(0.0, 1.0));
+            (eased, done)
+        }
+    }
+}
+
+/// One in-flight tween. Generic over the value type so colors,
+/// positions, scalars, and future quaternions all share the same
+/// machinery.
 #[derive(Clone, Debug)]
-pub struct Tween {
+pub struct Tween<T: Lerp> {
     /// User-facing tag. `Timeline::start` replaces any existing tween
     /// with the same key, which is how hover-on/hover-off interrupt
     /// each other smoothly.
     pub key: u32,
-    pub signal: Signal<f32>,
-    pub from: f32,
-    pub to: f32,
+    pub signal: Signal<T>,
+    pub from: T,
+    pub to: T,
     pub curve: Curve,
     pub start: Instant,
     pub duration: Duration,
 }
 
-impl Tween {
+impl<T: Lerp> Tween<T> {
     /// Returns `(value, done)` at `now`. The caller snaps to `to` when
     /// `done` is true.
-    fn sample(&self, now: Instant) -> (f32, bool) {
-        let elapsed = now.saturating_duration_since(self.start);
-        match self.curve {
-            Curve::Spring { stiffness, damping } => {
-                let t = elapsed.as_secs_f32();
-                let (x, vel) = spring_eval(stiffness, damping, t);
-                let val = self.from + (self.to - self.from) * x;
-                let settled = (x - 1.0).abs() < 1e-3 && vel.abs() < 1e-3;
-                (val, settled || elapsed >= self.duration)
-            }
-            _ => {
-                let total = self.duration.as_secs_f32().max(1e-6);
-                let t_norm = elapsed.as_secs_f32() / total;
-                let done = t_norm >= 1.0;
-                let eased = self.curve.eval(t_norm.clamp(0.0, 1.0));
-                let val = self.from + (self.to - self.from) * eased;
-                (val, done)
-            }
-        }
+    fn sample(&self, now: Instant) -> (T, bool) {
+        let (progress, done) = eval_progress(self.curve, self.start, self.duration, now);
+        (self.from.lerp(self.to, progress), done)
+    }
+}
+
+/// Type-erased tween interface used by `Timeline` so it can hold
+/// tweens of mixed value types in a single `Vec`.
+trait TweenDyn {
+    fn key(&self) -> u32;
+    /// Advance to `now`. Returns `(updated, done)` — `updated` is true
+    /// if the underlying signal's value actually changed.
+    fn step(&mut self, now: Instant) -> (bool, bool);
+}
+
+impl<T: Lerp> TweenDyn for Tween<T> {
+    fn key(&self) -> u32 {
+        self.key
+    }
+    fn step(&mut self, now: Instant) -> (bool, bool) {
+        let (val, done) = self.sample(now);
+        let final_val = if done { self.to } else { val };
+        let updated = self.signal.set(final_val);
+        (updated, done)
     }
 }
 
@@ -189,7 +257,7 @@ pub struct TickResult {
 /// (≈60 Hz) in stage 1. Once GPU timestamps + adaptive vsync land in
 /// M7/M9 this can become dynamic.
 pub struct Timeline {
-    tweens: Vec<Tween>,
+    tweens: Vec<Box<dyn TweenDyn>>,
     tick_interval: Duration,
 }
 
@@ -224,21 +292,21 @@ impl Timeline {
     /// Start (or restart) a tween for `key`. `from` is read from the
     /// signal's current value so mid-flight interrupts land smoothly.
     /// No-op if `from == to`.
-    pub fn start(
+    pub fn start<T: Lerp>(
         &mut self,
         key: u32,
-        signal: Signal<f32>,
-        to: f32,
+        signal: Signal<T>,
+        to: T,
         curve: Curve,
         duration: Duration,
         now: Instant,
     ) {
-        self.tweens.retain(|t| t.key != key);
+        self.tweens.retain(|t| t.key() != key);
         let from = signal.get();
         if from == to {
             return;
         }
-        self.tweens.push(Tween {
+        self.tweens.push(Box::new(Tween {
             key,
             signal,
             from,
@@ -246,11 +314,11 @@ impl Timeline {
             curve,
             start: now,
             duration,
-        });
+        }));
     }
 
     pub fn stop(&mut self, key: u32) {
-        self.tweens.retain(|t| t.key != key);
+        self.tweens.retain(|t| t.key() != key);
     }
 
     pub fn clear(&mut self) {
@@ -263,9 +331,8 @@ impl Timeline {
     pub fn tick(&mut self, now: Instant) -> TickResult {
         let mut updated = false;
         self.tweens.retain_mut(|tw| {
-            let (val, done) = tw.sample(now);
-            let final_val = if done { tw.to } else { val };
-            if tw.signal.set(final_val) {
+            let (changed, done) = tw.step(now);
+            if changed {
                 updated = true;
             }
             !done
@@ -357,7 +424,9 @@ mod tests {
         );
         tl.tick(now + Duration::from_millis(40));
         let mid_val = s.get();
-        // Reverse mid-flight.
+        assert!(mid_val > 0.3 && mid_val < 0.5);
+        // Reverse mid-flight. New tween must read current signal value
+        // as `from` so the reversal is smooth (no jump back to 1.0).
         tl.start(
             0,
             s.clone(),
@@ -367,9 +436,35 @@ mod tests {
             now + Duration::from_millis(40),
         );
         assert_eq!(tl.len(), 1);
-        // New tween starts from `mid_val`, not 1.0.
-        let tw = &tl.tweens[0];
-        assert_eq!(tw.from, mid_val);
-        assert_eq!(tw.to, 0.0);
+        // After half the new tween's duration we should be roughly halfway
+        // between mid_val and 0 — proves the new `from` was `mid_val`.
+        tl.tick(now + Duration::from_millis(90));
+        let after = s.get();
+        let expected = mid_val * 0.5;
+        assert!((after - expected).abs() < 0.05, "after={after} expected~{expected}");
+    }
+
+    #[test]
+    fn vector_tween_lerps_components() {
+        let s = Signal::new([0.0_f32, 0.0, 0.0, 1.0]);
+        let mut tl = Timeline::new();
+        let now = Instant::now();
+        tl.start(
+            0,
+            s.clone(),
+            [1.0, 0.5, 0.25, 1.0],
+            Curve::Linear,
+            Duration::from_millis(100),
+            now,
+        );
+        tl.tick(now + Duration::from_millis(50));
+        let v = s.get();
+        assert!((v[0] - 0.5).abs() < 1e-3);
+        assert!((v[1] - 0.25).abs() < 1e-3);
+        assert!((v[2] - 0.125).abs() < 1e-3);
+        assert_eq!(v[3], 1.0);
+        let end = tl.tick(now + Duration::from_millis(120));
+        assert!(end.updated);
+        assert_eq!(s.get(), [1.0, 0.5, 0.25, 1.0]);
     }
 }

@@ -18,14 +18,20 @@
 //! winit event loop, a demo scene, and env-var-driven headless captures.
 
 pub mod anim;
+pub mod app;
 pub mod debug;
 pub mod gpu;
 pub mod input;
 pub mod node;
+pub mod reactive;
+pub mod scene;
 pub mod signal;
 
-pub use anim::{Curve, TickResult, Timeline, Tween};
+pub use anim::{Curve, Lerp, TickResult, Timeline, Tween};
+pub use app::{App, AppConfig, HeadlessHelper};
 pub use gpu::{FrameUniform, GpuContext, ShapeInstance};
 pub use input::{InputChange, InputState};
 pub use node::{dirty, HitEntry, Node, NodeBuilder, NodeId, NodeTree, ShapeKind, ShapeStyle};
+pub use reactive::{animated, AnimatedBind, Bind, Computed, DepTuple, Source};
+pub use scene::{BindRegistry, ColorBindSlot, NodeBuilderRef, Scene, SceneCtx};
 pub use signal::Signal;
