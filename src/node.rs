@@ -8,7 +8,8 @@
 //! `NodeId`s are stable across mutations of *other* nodes — they only
 //! invalidate when the specific slot they refer to is reused.
 
-use crate::gpu::ShapeInstance;
+use crate::gpu::{ShapeInstance, SHAPE_KIND_GLASS, SHAPE_KIND_RECT};
+use crate::signal::Signal;
 
 /// Tree-level dirty flags. M3 collapses everything to a single
 /// re-flatten + full re-upload when any bit is set; M9 may switch to
@@ -21,7 +22,45 @@ pub mod dirty {
     pub const TRANSFORM: u32 = 1 << 1;
     /// Tree topology changed (add, remove, visibility flip).
     pub const TREE: u32 = 1 << 2;
-    pub const ANY: u32 = VISUAL | TRANSFORM | TREE;
+    /// Glass region moved/resized/roughness changed → re-run blur.
+    /// Superset of TRANSFORM for glass nodes, but tracked separately so the
+    /// renderer can skip blur when no glass changed.
+    pub const BACKDROP: u32 = 1 << 3;
+    pub const ANY: u32 = VISUAL | TRANSFORM | TREE | BACKDROP;
+}
+
+/// One interactive rect in the hit-test cache. Produced by
+/// `NodeTree::flatten_with_hits` in **topmost-first** order (last-painted
+/// first) so hit-test can walk linearly and stop at the first containing
+/// rect.
+#[derive(Clone, Debug)]
+pub struct HitEntry {
+    pub node_id: NodeId,
+    /// Absolute pixel AABB: `[min_x, min_y, max_x, max_y]`.
+    pub bounds: [f32; 4],
+}
+
+impl HitEntry {
+    pub fn contains(&self, x: f32, y: f32) -> bool {
+        x >= self.bounds[0] && x < self.bounds[2] && y >= self.bounds[1] && y < self.bounds[3]
+    }
+}
+
+/// Shape kinds exposed in the builder API. Maps directly to the WGSL
+/// `shape_kind` discriminator.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ShapeKind {
+    Rect,
+    Glass,
+}
+
+impl ShapeKind {
+    pub fn as_u32(self) -> u32 {
+        match self {
+            ShapeKind::Rect => SHAPE_KIND_RECT,
+            ShapeKind::Glass => SHAPE_KIND_GLASS,
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -41,6 +80,9 @@ pub struct ShapeStyle {
     pub shadow_blur: f32,
     pub shadow_opacity: f32,
     pub opacity: f32,
+    pub kind: ShapeKind,
+    /// Only meaningful for glass. 0..1 drives kernel spread in the shader.
+    pub roughness: f32,
 }
 
 impl Default for ShapeStyle {
@@ -55,7 +97,22 @@ impl Default for ShapeStyle {
             shadow_blur: 0.0,
             shadow_opacity: 0.0,
             opacity: 1.0,
+            kind: ShapeKind::Rect,
+            roughness: 0.0,
         }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct NodeInteract {
+    pub hover: Option<Signal<bool>>,
+    pub pressed: Option<Signal<bool>>,
+    pub focused: Option<Signal<bool>>,
+}
+
+impl NodeInteract {
+    pub fn is_any(&self) -> bool {
+        self.hover.is_some() || self.pressed.is_some() || self.focused.is_some()
     }
 }
 
@@ -66,6 +123,7 @@ pub struct Node {
     pub size: [f32; 2],
     pub visible: bool,
     pub children: Vec<NodeId>,
+    pub interact: NodeInteract,
 }
 
 impl Node {
@@ -77,8 +135,20 @@ impl Node {
                 size: [0.0, 0.0],
                 visible: true,
                 children: Vec::new(),
+                interact: NodeInteract::default(),
             },
         }
+    }
+
+    /// Frosted glass rect. Samples the blurred backdrop behind it.
+    /// `color` is an optional tint composited over the blurred sample
+    /// (use a low-alpha tint for that subtle frosted look).
+    pub fn glass() -> NodeBuilder {
+        let mut b = Self::rect();
+        b.node.style.kind = ShapeKind::Glass;
+        b.node.style.color = [1.0, 1.0, 1.0, 0.08];
+        b.node.style.roughness = 0.5;
+        b
     }
 }
 
@@ -131,6 +201,29 @@ impl NodeBuilder {
     }
     pub fn hidden(mut self) -> Self {
         self.node.visible = false;
+        self
+    }
+    pub fn kind(mut self, kind: ShapeKind) -> Self {
+        self.node.style.kind = kind;
+        self
+    }
+    pub fn roughness(mut self, r: f32) -> Self {
+        self.node.style.roughness = r;
+        self
+    }
+    /// Attach a hover signal. It will be set to `true` when the pointer
+    /// is over this node, `false` otherwise. Caller can keep a clone of
+    /// the same signal to drive reactive behavior.
+    pub fn on_hover(mut self, signal: Signal<bool>) -> Self {
+        self.node.interact.hover = Some(signal);
+        self
+    }
+    pub fn on_press(mut self, signal: Signal<bool>) -> Self {
+        self.node.interact.pressed = Some(signal);
+        self
+    }
+    pub fn on_focus(mut self, signal: Signal<bool>) -> Self {
+        self.node.interact.focused = Some(signal);
         self
     }
     pub fn build(self) -> Node {
@@ -210,8 +303,15 @@ impl NodeTree {
     pub fn set_position(&mut self, id: NodeId, position: [f32; 2]) {
         if let Some(n) = self.get_mut_raw(id) {
             if n.position != position {
+                let is_glass = n.style.kind == ShapeKind::Glass;
                 n.position = position;
                 self.dirty |= dirty::TRANSFORM;
+                // Any movement anywhere in the tree could change what a
+                // glass rect sees behind it — we don't track bounds
+                // overlap yet, so be conservative and flag BACKDROP too.
+                // Glass own movement obviously also needs it.
+                let _ = is_glass;
+                self.dirty |= dirty::BACKDROP;
             }
         }
     }
@@ -220,7 +320,7 @@ impl NodeTree {
         if let Some(n) = self.get_mut_raw(id) {
             if n.size != size {
                 n.size = size;
-                self.dirty |= dirty::TRANSFORM;
+                self.dirty |= dirty::TRANSFORM | dirty::BACKDROP;
             }
         }
     }
@@ -228,7 +328,22 @@ impl NodeTree {
     pub fn set_color(&mut self, id: NodeId, color: [f32; 4]) {
         if let Some(n) = self.get_mut_raw(id) {
             if n.style.color != color {
+                let is_opaque_change = n.style.kind != ShapeKind::Glass;
                 n.style.color = color;
+                self.dirty |= dirty::VISUAL;
+                if is_opaque_change {
+                    // Opaque recolor → backdrop tex content changed →
+                    // re-blur required.
+                    self.dirty |= dirty::BACKDROP;
+                }
+            }
+        }
+    }
+
+    pub fn set_roughness(&mut self, id: NodeId, roughness: f32) {
+        if let Some(n) = self.get_mut_raw(id) {
+            if n.style.roughness != roughness {
+                n.style.roughness = roughness;
                 self.dirty |= dirty::VISUAL;
             }
         }
@@ -304,12 +419,26 @@ impl NodeTree {
     /// DFS preorder flatten into GPU instances. Parent position adds to
     /// each descendant. Parent opacity multiplies down. Hidden nodes (and
     /// their subtrees) are skipped.
-    pub fn flatten(&self) -> Vec<ShapeInstance> {
-        let mut out = Vec::with_capacity(self.len());
+    ///
+    /// Partitioned output: opaque shapes first, glass shapes after.
+    /// Returns the number of opaque instances (range `0..opaque_count` is
+    /// drawn into the backdrop texture, `opaque_count..len` samples it).
+    /// Z order within each partition is preserved DFS preorder.
+    ///
+    /// The third return is the interactive hit-test cache in
+    /// **topmost-first** order — walk it linearly for pointer events.
+    pub fn flatten(&self) -> (Vec<ShapeInstance>, u32, Vec<HitEntry>) {
+        let mut opaque = Vec::with_capacity(self.len());
+        let mut glass = Vec::new();
+        let mut hits = Vec::new();
         for root in &self.roots {
-            self.flatten_into(*root, [0.0, 0.0], 1.0, &mut out);
+            self.flatten_into(*root, [0.0, 0.0], 1.0, &mut opaque, &mut glass, &mut hits);
         }
-        out
+        let opaque_count = opaque.len() as u32;
+        opaque.extend(glass);
+        // Reverse so topmost (last-drawn) comes first.
+        hits.reverse();
+        (opaque, opaque_count, hits)
     }
 
     fn flatten_into(
@@ -317,7 +446,9 @@ impl NodeTree {
         id: NodeId,
         parent_offset: [f32; 2],
         parent_opacity: f32,
-        out: &mut Vec<ShapeInstance>,
+        opaque: &mut Vec<ShapeInstance>,
+        glass: &mut Vec<ShapeInstance>,
+        hits: &mut Vec<HitEntry>,
     ) {
         let Some(node) = self.get(id) else { return };
         if !node.visible {
@@ -328,22 +459,40 @@ impl NodeTree {
             parent_offset[1] + node.position[1],
         ];
         let opacity = parent_opacity * node.style.opacity;
-        out.push(ShapeInstance {
+        let instance = ShapeInstance {
             color: node.style.color,
             border_color: node.style.border_color,
             shadow_color: node.style.shadow_color,
             border_radius: node.style.border_radius,
+            // UV rect filled at upload time — flatten doesn't know screen size.
+            backdrop_uv_rect: [0.0, 0.0, 0.0, 0.0],
             position: abs,
             size: node.size,
             shadow_offset: node.style.shadow_offset,
-            _pad0: [0.0; 2],
+            shape_kind: node.style.kind.as_u32(),
+            roughness: node.style.roughness,
             border_width: node.style.border_width,
             shadow_blur: node.style.shadow_blur,
             shadow_opacity: node.style.shadow_opacity,
             opacity,
-        });
+        };
+        match node.style.kind {
+            ShapeKind::Rect => opaque.push(instance),
+            ShapeKind::Glass => glass.push(instance),
+        }
+        if node.interact.is_any() {
+            hits.push(HitEntry {
+                node_id: id,
+                bounds: [
+                    abs[0],
+                    abs[1],
+                    abs[0] + node.size[0],
+                    abs[1] + node.size[1],
+                ],
+            });
+        }
         for &child in &node.children {
-            self.flatten_into(child, abs, opacity, out);
+            self.flatten_into(child, abs, opacity, opaque, glass, hits);
         }
     }
 }

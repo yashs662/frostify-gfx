@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use winit::window::Window;
 
+use super::blur::BlurResources;
 use super::instance::{FrameUniform, ShapeInstance};
 use super::pipeline::ShapePipeline;
 
@@ -15,10 +16,17 @@ pub struct GpuContext {
     pub window: Arc<Window>,
 
     pub shape: ShapePipeline,
+    pub blur: BlurResources,
     instance_buffer: wgpu::Buffer,
     instance_capacity: u64,
-    bind_group: wgpu::BindGroup,
+    shape_bg: wgpu::BindGroup,
+    glass_bg: wgpu::BindGroup,
+
     instance_count: u32,
+    opaque_count: u32,
+    /// Needs a re-run of the blur compute pass on the next render. Set by
+    /// `set_instances`; cleared after render.
+    backdrop_dirty: bool,
 }
 
 impl GpuContext {
@@ -91,6 +99,7 @@ impl GpuContext {
         );
 
         let shape = ShapePipeline::new(&device, format);
+        let blur = BlurResources::new(&device, width, height);
 
         // Allocate an initial instance buffer with room for one shape.
         let instance_capacity: u64 = 16;
@@ -101,7 +110,8 @@ impl GpuContext {
             mapped_at_creation: false,
         });
 
-        let bind_group = make_bind_group(&device, &shape, &instance_buffer);
+        let shape_bg = make_shape_bg(&device, &shape, &instance_buffer);
+        let glass_bg = make_glass_bg(&device, &shape, &blur);
 
         // Write initial frame uniform.
         queue.write_buffer(
@@ -121,10 +131,14 @@ impl GpuContext {
             surface_config,
             window,
             shape,
+            blur,
             instance_buffer,
             instance_capacity,
-            bind_group,
+            shape_bg,
+            glass_bg,
             instance_count: 0,
+            opaque_count: 0,
+            backdrop_dirty: true,
         }
     }
 
@@ -136,18 +150,26 @@ impl GpuContext {
             &self.shape.frame_buffer,
             0,
             bytemuck::bytes_of(&FrameUniform {
-                screen_size: [self.surface_config.width as f32, self.surface_config.height as f32],
+                screen_size: [
+                    self.surface_config.width as f32,
+                    self.surface_config.height as f32,
+                ],
                 _pad: [0.0; 2],
             }),
         );
+        self.blur
+            .resize(&self.device, self.surface_config.width, self.surface_config.height);
+        // Blurred view changed — rebuild the glass bind group.
+        self.glass_bg = make_glass_bg(&self.device, &self.shape, &self.blur);
+        self.backdrop_dirty = true;
     }
 
-    /// Upload a complete instance list. M1: full rewrite each call.
-    /// M3 will replace this with dirty-slot partial writes.
-    pub fn set_instances(&mut self, instances: &[ShapeInstance]) {
+    /// Upload a complete instance list. Partitioned caller-side: the first
+    /// `opaque_count` entries are opaque shapes (drawn to backdrop + final),
+    /// the remainder are glass shapes (drawn only in the final pass).
+    pub fn set_instances(&mut self, instances: &[ShapeInstance], opaque_count: u32) {
         let needed = instances.len() as u64;
         if needed > self.instance_capacity {
-            // Grow power-of-two.
             let mut new_cap = self.instance_capacity.max(1);
             while new_cap < needed {
                 new_cap *= 2;
@@ -159,7 +181,7 @@ impl GpuContext {
                 mapped_at_creation: false,
             });
             self.instance_capacity = new_cap;
-            self.bind_group = make_bind_group(&self.device, &self.shape, &self.instance_buffer);
+            self.shape_bg = make_shape_bg(&self.device, &self.shape, &self.instance_buffer);
         }
 
         if !instances.is_empty() {
@@ -167,6 +189,82 @@ impl GpuContext {
                 .write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(instances));
         }
         self.instance_count = instances.len() as u32;
+        self.opaque_count = opaque_count.min(self.instance_count);
+        // Instance content changed → backdrop must be rebuilt.
+        self.backdrop_dirty = true;
+    }
+
+    pub fn glass_count(&self) -> u32 {
+        self.instance_count - self.opaque_count
+    }
+
+    pub fn mark_backdrop_dirty(&mut self) {
+        self.backdrop_dirty = true;
+    }
+
+    /// Encode the opaque pass, blur pass (if needed), and final pass into
+    /// `encoder`. `final_view` is the render target for the surface pass.
+    fn encode_frame(&mut self, encoder: &mut wgpu::CommandEncoder, final_view: &wgpu::TextureView) {
+        // ---- Pass A: opaque shapes → backdrop_tex ------------------------
+        {
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("frostify.backdrop pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.blur.backdrop_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            if self.opaque_count > 0 {
+                rpass.set_pipeline(&self.shape.opaque_pipeline);
+                rpass.set_bind_group(0, &self.shape_bg, &[]);
+                rpass.draw(0..6, 0..self.opaque_count);
+            }
+        }
+
+        // ---- Pass B: separable Gaussian blur ----------------------------
+        // Always runs when glass is present. Skipped if no glass in scene.
+        let has_glass = self.glass_count() > 0;
+        if has_glass {
+            // Radius is fixed stage-1; M9 will key it off per-shape roughness.
+            let radius: u32 = 16;
+            self.blur.run(&self.queue, encoder, radius);
+            self.backdrop_dirty = false;
+        }
+
+        // ---- Pass C: final surface ------------------------------------
+        {
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("frostify.final pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: final_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            if self.instance_count > 0 {
+                rpass.set_pipeline(&self.shape.final_pipeline);
+                rpass.set_bind_group(0, &self.shape_bg, &[]);
+                rpass.set_bind_group(1, &self.glass_bg, &[]);
+                rpass.draw(0..6, 0..self.instance_count);
+            }
+        }
     }
 
     /// Acquire, render, present.
@@ -174,13 +272,13 @@ impl GpuContext {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(tex)
             | wgpu::CurrentSurfaceTexture::Suboptimal(tex) => tex,
-            wgpu::CurrentSurfaceTexture::Outdated
-            | wgpu::CurrentSurfaceTexture::Lost => {
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.surface_config);
                 return;
             }
-            wgpu::CurrentSurfaceTexture::Timeout
-            | wgpu::CurrentSurfaceTexture::Occluded => return,
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                return
+            }
             wgpu::CurrentSurfaceTexture::Validation => {
                 log::error!("surface validation error");
                 return;
@@ -196,30 +294,7 @@ impl GpuContext {
                 label: Some("frostify-gfx frame"),
             });
 
-        {
-            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("shape pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-
-            if self.instance_count > 0 {
-                rpass.set_pipeline(&self.shape.pipeline);
-                rpass.set_bind_group(0, &self.bind_group, &[]);
-                rpass.draw(0..6, 0..self.instance_count);
-            }
-        }
+        self.encode_frame(&mut encoder, &view);
 
         self.queue.submit(std::iter::once(encoder.finish()));
         self.window.pre_present_notify();
@@ -233,8 +308,6 @@ impl GpuContext {
         let width = self.surface_config.width;
         let height = self.surface_config.height;
 
-        // Offscreen color target that we fully control (the swapchain copy
-        // path is racy with present). Render the same pipeline into it.
         let target = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("frostify.capture target"),
             size: wgpu::Extent3d {
@@ -270,29 +343,9 @@ impl GpuContext {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frostify.capture encoder"),
             });
-        {
-            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("capture pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            if self.instance_count > 0 {
-                rpass.set_pipeline(&self.shape.pipeline);
-                rpass.set_bind_group(0, &self.bind_group, &[]);
-                rpass.draw(0..6, 0..self.instance_count);
-            }
-        }
+
+        self.encode_frame(&mut encoder, &view);
+
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &target,
@@ -316,7 +369,6 @@ impl GpuContext {
         );
         self.queue.submit(std::iter::once(encoder.finish()));
 
-        // Block until the GPU is done, then map.
         let slice = readback.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |res| {
@@ -342,7 +394,6 @@ impl GpuContext {
         drop(view);
         readback.unmap();
 
-        // Swap BGRA -> RGBA if needed, for PNG encode.
         if matches!(
             self.surface_config.format,
             wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
@@ -356,14 +407,14 @@ impl GpuContext {
     }
 }
 
-fn make_bind_group(
+fn make_shape_bg(
     device: &wgpu::Device,
     shape: &ShapePipeline,
     instance_buffer: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("frostify.shape bg"),
-        layout: &shape.bind_group_layout,
+        layout: &shape.shape_bgl,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
@@ -377,3 +428,23 @@ fn make_bind_group(
     })
 }
 
+fn make_glass_bg(
+    device: &wgpu::Device,
+    shape: &ShapePipeline,
+    blur: &BlurResources,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("frostify.glass bg"),
+        layout: &shape.glass_bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&blur.blurred_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&blur.sampler),
+            },
+        ],
+    })
+}

@@ -55,3 +55,12 @@ impl<T: Copy + PartialEq> Clone for Signal<T> {
         }
     }
 }
+
+impl<T: Copy + PartialEq + std::fmt::Debug> std::fmt::Debug for Signal<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Signal")
+            .field("value", &self.get())
+            .field("version", &self.version())
+            .finish()
+    }
+}
