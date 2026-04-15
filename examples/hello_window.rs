@@ -15,11 +15,17 @@
 //!
 //! Headless verification env vars (each adds one or more frames to
 //! `debug_captures/`):
+//! CLI flags (override env vars when present):
+//!   --capture frames=N out=DIR     → render N frames + exit.
+//!
+//! Headless verification env vars (each adds one or more frames to
+//! `debug_captures/`):
 //!   FROSTIFY_AUTOCAPTURE=1         → render once + capture, then exit.
 //!   FROSTIFY_AUTOCAPTURE_HIT=1     → also synthesize hover + press.
 //!   FROSTIFY_AUTOCAPTURE_GLASS=1   → also move the blob + capture.
 //!   FROSTIFY_AUTOCAPTURE_TOGGLE=1  → also toggle hero_lit + capture.
 //!   FROSTIFY_AUTOCAPTURE_ANIM=1    → also drive a hover tween + capture.
+//!   FROSTIFY_AUTOCAPTURE_OVERDRAW=1 → also enable the F4 heatmap + capture.
 
 use std::cell::Cell;
 use std::env;
@@ -207,6 +213,45 @@ fn run_headless(h: &mut HeadlessHelper, sigs: Sigs, blob_x: Rc<Cell<f32>>) {
         h.render();
         h.capture();
     }
+    if env::var_os("FROSTIFY_AUTOCAPTURE_OVERDRAW").is_some() {
+        h.gpu.set_overdraw(true);
+        h.flush();
+        h.render();
+        h.capture();
+        h.gpu.set_overdraw(false);
+    }
+    if env::var_os("FROSTIFY_AUTOCAPTURE_HUD").is_some() {
+        h.show_hud();
+        h.render();
+        h.capture();
+        h.hide_hud();
+    }
+}
+
+/// Tiny `--capture frames=N out=DIR` parser. Returns `None` when the
+/// flag isn't present so callers can fall back to env-var capture or
+/// interactive mode. Stage-1 stays clap-free.
+fn parse_capture_cli() -> Option<(u32, std::path::PathBuf)> {
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg != "--capture" {
+            continue;
+        }
+        let mut frames: u32 = 1;
+        let mut out = std::path::PathBuf::from("debug_captures");
+        for kv in args.by_ref() {
+            if kv.starts_with("--") {
+                break;
+            }
+            if let Some(v) = kv.strip_prefix("frames=") {
+                frames = v.parse().unwrap_or(1).max(1);
+            } else if let Some(v) = kv.strip_prefix("out=") {
+                out = std::path::PathBuf::from(v);
+            }
+        }
+        return Some((frames, out));
+    }
+    None
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -227,7 +272,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Honors FROSTIFY_AUTOCAPTURE for plain single-frame CI runs.
         // Multi-frame scripted capture flows attach `.headless(...)`
         // below to drive the demo-specific sub-sequences.
-        .capture_from_env()
+        .capture_from_env();
+    if let Some((frames, dir)) = parse_capture_cli() {
+        app = app.capture(frames, dir);
+    }
+    let mut app = app
         .on_key(move |code, state, ctx| {
             if state != ElementState::Pressed {
                 return;

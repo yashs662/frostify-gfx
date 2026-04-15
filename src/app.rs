@@ -41,7 +41,7 @@ use winit::window::{Window, WindowId};
 
 use crate::anim::Timeline;
 use crate::debug;
-use crate::gpu::{GpuContext, ShapeInstance};
+use crate::gpu::{FrameStats, GpuContext, ShapeInstance};
 use crate::input::InputState;
 use crate::node::HitEntry;
 use crate::scene::{ColorBindSlot, Scene, SceneCtx};
@@ -102,6 +102,17 @@ pub struct App {
     /// a normal interactive run. `Some(n)` triggers headless capture
     /// mode in `resumed`.
     capture_frames: Option<u32>,
+    /// Last dirty bitmask consumed by `flush_tree`. Cleared on read by
+    /// `take_dirty`, so we cache it for later stat dumps.
+    last_dirty_mask: u32,
+    /// Wall-clock CPU time of the most recent `render_once` call.
+    last_cpu_ms: f32,
+    /// Stat-dump cadence: continuously log on every render when set.
+    /// Toggled by `FROSTIFY_STATS=1` env var or by F1 in interactive mode.
+    stats_log: bool,
+    /// Bar-gauge HUD overlay: enabled by F1 (along with stats logging).
+    /// Stage-1 has no text renderer, so the HUD is rect-only.
+    hud_enabled: bool,
     // Lazy:
     window: Option<Arc<Window>>,
     gpu: Option<GpuContext>,
@@ -120,6 +131,10 @@ impl App {
             on_key: None,
             headless: None,
             capture_frames: None,
+            last_dirty_mask: 0,
+            last_cpu_ms: 0.0,
+            stats_log: std::env::var_os("FROSTIFY_STATS").is_some(),
+            hud_enabled: std::env::var_os("FROSTIFY_HUD").is_some(),
             window: None,
             gpu: None,
         }
@@ -228,9 +243,11 @@ impl App {
 
     /// Re-flatten + upload the tree if any dirty flag is set.
     fn flush_tree(&mut self) -> bool {
-        if self.ctx.tree.take_dirty() == 0 {
+        let mask = self.ctx.tree.take_dirty();
+        if mask == 0 {
             return false;
         }
+        self.last_dirty_mask = mask;
         let (flat, opaque_count, hits) = self.ctx.tree.flatten();
         self.instances = flat;
         self.opaque_count = opaque_count;
@@ -248,9 +265,47 @@ impl App {
     }
 
     fn render_once(&mut self) {
-        if let Some(gpu) = self.gpu.as_mut() {
-            gpu.render_frame();
+        if self.hud_enabled {
+            self.refresh_hud_overlay();
         }
+        let Some(gpu) = self.gpu.as_mut() else {
+            return;
+        };
+        let t0 = Instant::now();
+        gpu.render_frame();
+        self.last_cpu_ms = t0.elapsed().as_secs_f32() * 1_000.0;
+        if self.stats_log {
+            log::info!("frame stats: {:?}", self.current_stats());
+        }
+    }
+
+    /// Build a small set of debug rectangles representing the most
+    /// recent frame stats and upload them as overlay instances. Cleared
+    /// when `hud_enabled` flips off.
+    fn refresh_hud_overlay(&mut self) {
+        let stats = self.current_stats();
+        let instances = build_hud_instances(&stats);
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.set_overlay_instances(&instances);
+        }
+    }
+
+    fn clear_hud_overlay(&mut self) {
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.set_overlay_instances(&[]);
+        }
+    }
+
+    /// Combine the renderer's GPU stats with the app-side CPU + dirty mask.
+    pub fn current_stats(&self) -> FrameStats {
+        let mut s = self
+            .gpu
+            .as_ref()
+            .map(|g| g.last_frame_stats())
+            .unwrap_or_default();
+        s.cpu_ms = self.last_cpu_ms;
+        s.dirty_mask = self.last_dirty_mask;
+        s
     }
 
     /// Walk every reactive bind. For each slot whose source version
@@ -295,7 +350,77 @@ impl App {
             Ok(()) => log::info!("screenshot saved: {}", path.display()),
             Err(e) => log::error!("screenshot failed: {e}"),
         }
+        let stats = self.current_stats();
+        debug::write_stats_sidecar(&path, &stats);
     }
+}
+
+/// Bar-gauge HUD layout. Stage-1 is rect-only — see PLAN.md "no text"
+/// rule. Each metric gets a horizontal bar; the fill width is a
+/// fraction (0..=1) of a per-metric reference cap. Color shifts from
+/// green → yellow → red as the fraction crosses 0.5 / 0.8.
+fn build_hud_instances(stats: &FrameStats) -> Vec<ShapeInstance> {
+    const ORIGIN_X: f32 = 12.0;
+    const ORIGIN_Y: f32 = 12.0;
+    const BAR_W: f32 = 200.0;
+    const BAR_H: f32 = 10.0;
+    const BAR_GAP: f32 = 6.0;
+    const PAD: f32 = 8.0;
+
+    let metrics = [
+        ("cpu", stats.cpu_ms / 16.6),
+        ("gpu", stats.gpu_ms / 16.6),
+        ("inst", stats.instance_count as f32 / 256.0),
+        ("draw", stats.drawcalls as f32 / 16.0),
+    ];
+
+    let panel_w = BAR_W + PAD * 2.0;
+    let panel_h = (BAR_H + BAR_GAP) * metrics.len() as f32 + PAD * 2.0 - BAR_GAP;
+
+    let mut out = Vec::with_capacity(1 + metrics.len() * 2);
+
+    // Background panel.
+    out.push(ShapeInstance {
+        color: [0.0, 0.0, 0.0, 0.6],
+        position: [ORIGIN_X, ORIGIN_Y],
+        size: [panel_w, panel_h],
+        border_radius: [6.0; 4],
+        ..Default::default()
+    });
+
+    for (i, (_, frac)) in metrics.iter().enumerate() {
+        let bar_y = ORIGIN_Y + PAD + i as f32 * (BAR_H + BAR_GAP);
+        let bar_x = ORIGIN_X + PAD;
+        // Bar background.
+        out.push(ShapeInstance {
+            color: [1.0, 1.0, 1.0, 0.10],
+            position: [bar_x, bar_y],
+            size: [BAR_W, BAR_H],
+            border_radius: [3.0; 4],
+            ..Default::default()
+        });
+        // Bar fill.
+        let f = frac.clamp(0.0, 1.0);
+        let fill_w = (BAR_W * f).max(0.0);
+        let color = if f < 0.5 {
+            [0.30, 0.85, 0.40, 1.0]
+        } else if f < 0.8 {
+            [0.95, 0.80, 0.20, 1.0]
+        } else {
+            [0.95, 0.30, 0.30, 1.0]
+        };
+        if fill_w > 0.0 {
+            out.push(ShapeInstance {
+                color,
+                position: [bar_x, bar_y],
+                size: [fill_w, BAR_H],
+                border_radius: [3.0; 4],
+                ..Default::default()
+            });
+        }
+    }
+
+    out
 }
 
 /// Walk the color bind list. For each slot whose underlying source
@@ -366,6 +491,10 @@ impl<'a> HeadlessHelper<'a> {
             Ok(()) => log::info!("auto-capture saved: {}", path.display()),
             Err(e) => log::error!("auto-capture failed: {e}"),
         }
+        let mut stats = self.gpu.last_frame_stats();
+        // CPU ms isn't tracked here — capture path is non-hot. Leave at 0.0.
+        stats.dirty_mask = 0;
+        debug::write_stats_sidecar(&path, &stats);
     }
 
     /// Fast-forward every active tween to its target, push the
@@ -387,6 +516,19 @@ impl<'a> HeadlessHelper<'a> {
                 self.ctx.tree.set_color(slot.node_id, disp.get());
             }
         }
+    }
+
+    /// Build + upload the bar-gauge HUD overlay from the renderer's
+    /// most recent frame stats. Calls `set_overlay_instances`.
+    pub fn show_hud(&mut self) {
+        let stats = self.gpu.last_frame_stats();
+        let inst = build_hud_instances(&stats);
+        self.gpu.set_overlay_instances(&inst);
+    }
+
+    /// Clear any active HUD overlay.
+    pub fn hide_hud(&mut self) {
+        self.gpu.set_overlay_instances(&[]);
     }
 
     /// Run reactive bind processing + animated display pump on the
@@ -549,8 +691,31 @@ impl ApplicationHandler for App {
                             event_loop.exit();
                             return;
                         }
+                        KeyCode::F1 => {
+                            self.hud_enabled = !self.hud_enabled;
+                            self.stats_log = self.hud_enabled;
+                            log::info!(
+                                "hud/stats: {} | last frame: {:?}",
+                                if self.hud_enabled { "on" } else { "off" },
+                                self.current_stats()
+                            );
+                            if !self.hud_enabled {
+                                self.clear_hud_overlay();
+                            }
+                            self.request_redraw();
+                            return;
+                        }
                         KeyCode::F2 => {
                             self.save_screenshot();
+                            return;
+                        }
+                        KeyCode::F4 => {
+                            if let Some(g) = self.gpu.as_mut() {
+                                let on = !g.overdraw_mode();
+                                g.set_overdraw(on);
+                                log::info!("overdraw heatmap: {}", if on { "on" } else { "off" });
+                            }
+                            self.request_redraw();
                             return;
                         }
                         KeyCode::F5 => {
