@@ -6,7 +6,7 @@ pub mod pipeline;
 pub mod timing;
 
 pub use blur::{BlurResources, BACKDROP_FORMAT};
-pub use context::GpuContext;
+pub use context::{GpuContext, MemoryReport};
 pub use instance::{
     FrameUniform, ShapeInstance, SHAPE_KIND_GLASS, SHAPE_KIND_RECT,
 };

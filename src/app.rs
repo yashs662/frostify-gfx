@@ -252,8 +252,9 @@ impl App {
         self.instances = flat;
         self.opaque_count = opaque_count;
         self.hits = hits;
+        let backdrop_hint = mask & crate::node::dirty::BACKDROP != 0;
         if let Some(gpu) = self.gpu.as_mut() {
-            gpu.set_instances(&self.instances, self.opaque_count);
+            gpu.set_instances(&self.instances, self.opaque_count, backdrop_hint);
         }
         true
     }
@@ -294,6 +295,12 @@ impl App {
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.set_overlay_instances(&[]);
         }
+    }
+
+    /// Forward the GPU memory-allocation snapshot from the renderer.
+    /// Returns `None` if the GPU isn't initialised yet.
+    pub fn memory_report(&self) -> Option<crate::gpu::MemoryReport> {
+        self.gpu.as_ref().map(|g| g.memory_report())
     }
 
     /// Combine the renderer's GPU stats with the app-side CPU + dirty mask.
@@ -469,14 +476,17 @@ impl<'a> HeadlessHelper<'a> {
     /// Re-flatten + upload if the tree is dirty. Returns true if it
     /// actually uploaded (matches `App::flush_tree`).
     pub fn flush(&mut self) -> bool {
-        if self.ctx.tree.take_dirty() == 0 {
+        let mask = self.ctx.tree.take_dirty();
+        if mask == 0 {
             return false;
         }
         let (flat, opaque_count, hits) = self.ctx.tree.flatten();
         *self.instances = flat;
         *self.opaque_count = opaque_count;
         *self.hits = hits;
-        self.gpu.set_instances(self.instances, *self.opaque_count);
+        let backdrop_hint = mask & crate::node::dirty::BACKDROP != 0;
+        self.gpu
+            .set_instances(self.instances, *self.opaque_count, backdrop_hint);
         true
     }
 
@@ -572,6 +582,19 @@ impl ApplicationHandler for App {
         let window_arc: Arc<Window> = Arc::new(window);
         self.gpu = Some(GpuContext::new(Arc::clone(&window_arc)));
         self.window = Some(window_arc);
+
+        if let Some(mem) = self.memory_report() {
+            log::info!(
+                "gpu memory: total={} KiB (instance={} overlay={} blur={} overdraw={} timing={} prev_cpu={})",
+                mem.total() / 1024,
+                mem.instance_buffer,
+                mem.overlay_buffer,
+                mem.blur_textures,
+                mem.overdraw_textures,
+                mem.timing,
+                mem.prev_instances_cpu,
+            );
+        }
 
         // First flush + render so the visible window already shows
         // the scene by the time the user sees it.

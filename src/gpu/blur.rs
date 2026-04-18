@@ -44,6 +44,13 @@ pub struct BlurResources {
 }
 
 impl BlurResources {
+    /// Current offscreen resolution of the three blur textures.
+    pub fn resolution(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+}
+
+impl BlurResources {
     pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
         let (backdrop_tex, backdrop_view) = make_tex(device, width, height, "frostify.backdrop");
         let (tmp_tex, tmp_view) = make_tex(device, width, height, "frostify.blur.tmp");
@@ -202,8 +209,16 @@ impl BlurResources {
     }
 
     /// Encode both blur passes into `encoder`. `radius` is clamped so the
-    /// loop cost stays bounded.
-    pub fn run(&self, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, radius: u32) {
+    /// loop cost stays bounded. If `timing_qs` is `Some`, begin/end
+    /// timestamps are stamped at the start of the horizontal pass and
+    /// the end of the vertical pass.
+    pub fn run(
+        &self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        radius: u32,
+        timing_qs: Option<(&wgpu::QuerySet, u32, u32)>,
+    ) {
         let r = radius.clamp(1, 32);
         queue.write_buffer(
             &self.params_h,
@@ -230,7 +245,13 @@ impl BlurResources {
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("frostify.blur horizontal"),
-                timestamp_writes: None,
+                timestamp_writes: timing_qs.map(|(qs, begin, _)| {
+                    wgpu::ComputePassTimestampWrites {
+                        query_set: qs,
+                        beginning_of_pass_write_index: Some(begin),
+                        end_of_pass_write_index: None,
+                    }
+                }),
             });
             cpass.set_pipeline(&self.compute_pipeline);
             cpass.set_bind_group(0, &self.bg_h, &[]);
@@ -239,7 +260,13 @@ impl BlurResources {
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("frostify.blur vertical"),
-                timestamp_writes: None,
+                timestamp_writes: timing_qs.map(|(qs, _, end)| {
+                    wgpu::ComputePassTimestampWrites {
+                        query_set: qs,
+                        beginning_of_pass_write_index: None,
+                        end_of_pass_write_index: Some(end),
+                    }
+                }),
             });
             cpass.set_pipeline(&self.compute_pipeline);
             cpass.set_bind_group(0, &self.bg_v, &[]);

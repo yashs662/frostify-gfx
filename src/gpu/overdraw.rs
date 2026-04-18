@@ -31,6 +31,13 @@ pub struct OverdrawResources {
 }
 
 impl OverdrawResources {
+    /// Current resolution of the count texture.
+    pub fn resolution(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+}
+
+impl OverdrawResources {
     pub fn new(
         device: &wgpu::Device,
         width: u32,

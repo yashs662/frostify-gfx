@@ -29,7 +29,7 @@ pub mod signal;
 
 pub use anim::{Curve, Lerp, TickResult, Timeline, Tween};
 pub use app::{App, AppConfig, HeadlessHelper};
-pub use gpu::{FrameStats, FrameTiming, FrameUniform, GpuContext, ShapeInstance};
+pub use gpu::{FrameStats, FrameTiming, FrameUniform, GpuContext, MemoryReport, ShapeInstance};
 pub use input::{InputChange, InputState};
 pub use node::{dirty, HitEntry, Node, NodeBuilder, NodeId, NodeTree, ShapeKind, ShapeStyle};
 pub use reactive::{animated, AnimatedBind, Bind, Computed, DepTuple, Source};

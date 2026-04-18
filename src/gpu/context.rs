@@ -6,7 +6,10 @@ use super::blur::BlurResources;
 use super::instance::{FrameUniform, ShapeInstance};
 use super::overdraw::OverdrawResources;
 use super::pipeline::ShapePipeline;
-use super::timing::{FrameTiming, Timing};
+use super::timing::{
+    FrameTiming, PassAlloc, Timing, PASS_BLUR, PASS_FINAL, PASS_OD_COMPOSE, PASS_OD_COUNT,
+    PASS_OPAQUE,
+};
 
 /// Owns every wgpu handle the renderer touches.
 pub struct GpuContext {
@@ -36,6 +39,11 @@ pub struct GpuContext {
 
     instance_count: u32,
     opaque_count: u32,
+    /// Mirror of the most recent instance list uploaded to the GPU.
+    /// `set_instances` diffs against it to compute partial-upload
+    /// ranges; cleared (then rebuilt) on buffer grow or when the slot
+    /// count changes within the existing capacity.
+    prev_instances: Vec<ShapeInstance>,
     /// Needs a re-run of the blur compute pass on the next render. Set by
     /// `set_instances`; cleared after render.
     backdrop_dirty: bool,
@@ -190,6 +198,7 @@ impl GpuContext {
             overlay_count: 0,
             instance_count: 0,
             opaque_count: 0,
+            prev_instances: Vec::new(),
             backdrop_dirty: true,
             timing,
             last_drawcalls: 0,
@@ -235,16 +244,27 @@ impl GpuContext {
     /// Upload a complete instance list. Partitioned caller-side: the first
     /// `opaque_count` entries are opaque shapes (drawn to backdrop + final),
     /// the remainder are glass shapes (drawn only in the final pass).
-    pub fn set_instances(&mut self, instances: &[ShapeInstance], opaque_count: u32) {
+    /// `backdrop_hint` must be `true` when the caller knows the opaque
+    /// content changed (VISUAL/TRANSFORM/TREE on an opaque node); the
+    /// flag OR's into the existing `backdrop_dirty` state and is cleared
+    /// when the blur pass runs.
+    pub fn set_instances(
+        &mut self,
+        instances: &[ShapeInstance],
+        opaque_count: u32,
+        backdrop_hint: bool,
+    ) {
         let needed = instances.len() as u64;
-        if needed > self.instance_capacity {
+        let stride = std::mem::size_of::<ShapeInstance>() as u64;
+        let grew = needed > self.instance_capacity;
+        if grew {
             let mut new_cap = self.instance_capacity.max(1);
             while new_cap < needed {
                 new_cap *= 2;
             }
             self.instance_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("frostify.instance ssbo"),
-                size: new_cap * std::mem::size_of::<ShapeInstance>() as u64,
+                size: new_cap * stride,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
@@ -252,14 +272,49 @@ impl GpuContext {
             self.shape_bg = make_shape_bg(&self.device, &self.shape, &self.instance_buffer);
         }
 
-        if !instances.is_empty() {
-            self.queue
-                .write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(instances));
+        // Full upload on buffer grow or on any slot-count change (new
+        // instance count ≠ cached count) — slot indices may have shifted
+        // so per-slot diffing isn't safe. Otherwise diff byte-wise
+        // against `prev_instances` and coalesce contiguous dirty ranges
+        // into individual `write_buffer` calls.
+        if grew || instances.len() != self.prev_instances.len() {
+            if !instances.is_empty() {
+                self.queue
+                    .write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(instances));
+            }
+            self.prev_instances.clear();
+            self.prev_instances.extend_from_slice(instances);
+        } else {
+            let mut i = 0;
+            while i < instances.len() {
+                if bytemuck::bytes_of(&instances[i])
+                    == bytemuck::bytes_of(&self.prev_instances[i])
+                {
+                    i += 1;
+                    continue;
+                }
+                let start = i;
+                while i < instances.len()
+                    && bytemuck::bytes_of(&instances[i])
+                        != bytemuck::bytes_of(&self.prev_instances[i])
+                {
+                    i += 1;
+                }
+                let end = i;
+                self.queue.write_buffer(
+                    &self.instance_buffer,
+                    (start as u64) * stride,
+                    bytemuck::cast_slice(&instances[start..end]),
+                );
+                self.prev_instances[start..end].copy_from_slice(&instances[start..end]);
+            }
         }
+
         self.instance_count = instances.len() as u32;
         self.opaque_count = opaque_count.min(self.instance_count);
-        // Instance content changed → backdrop must be rebuilt.
-        self.backdrop_dirty = true;
+        if backdrop_hint {
+            self.backdrop_dirty = true;
+        }
     }
 
     pub fn glass_count(&self) -> u32 {
@@ -301,9 +356,58 @@ impl GpuContext {
     fn encode_frame(&mut self, encoder: &mut wgpu::CommandEncoder, final_view: &wgpu::TextureView) {
         let mut drawcalls: u32 = 0;
         let timing_qs = self.timing.as_ref().map(|t| &t.query_set);
+        let mut alloc = PassAlloc::new();
+        // The opaque pass exists only to populate `backdrop_tex` for the
+        // blur pass, which feeds `blurred_tex` read by glass shapes in
+        // the final pass. If there's no glass, the backdrop is never
+        // sampled; if glass exists but neither geometry nor color of
+        // opaque content changed since the last blur, the blurred_tex
+        // from the prior submit is still valid.
+        let has_glass = self.glass_count() > 0;
+        let run_backdrop = has_glass && self.backdrop_dirty;
+        // Pre-allocate query pairs for every pass that will run this
+        // frame. The pair indices are dense so `resolve_query_set` can
+        // cover a contiguous prefix.
+        let (opaque_begin, opaque_end) = match (timing_qs, run_backdrop) {
+            (Some(_), true) => {
+                let (b, e) = alloc.alloc(PASS_OPAQUE);
+                (Some(b), Some(e))
+            }
+            _ => (None, None),
+        };
+        let (blur_begin, blur_end) = match (timing_qs, run_backdrop) {
+            (Some(_), true) => {
+                let (b, e) = alloc.alloc(PASS_BLUR);
+                (Some(b), Some(e))
+            }
+            _ => (None, None),
+        };
+        let (final_begin, final_end) = match timing_qs {
+            Some(_) => {
+                let (b, e) = alloc.alloc(PASS_FINAL);
+                (Some(b), Some(e))
+            }
+            None => (None, None),
+        };
+        let (od_count_begin, od_count_end) = match (timing_qs, self.overdraw_mode) {
+            (Some(_), true) => {
+                let (b, e) = alloc.alloc(PASS_OD_COUNT);
+                (Some(b), Some(e))
+            }
+            _ => (None, None),
+        };
+        let (od_compose_begin, od_compose_end) = match (timing_qs, self.overdraw_mode) {
+            (Some(_), true) => {
+                let (b, e) = alloc.alloc(PASS_OD_COMPOSE);
+                (Some(b), Some(e))
+            }
+            _ => (None, None),
+        };
 
         // ---- Pass A: opaque shapes → backdrop_tex ------------------------
-        {
+        // Skipped when no glass exists (backdrop_tex unused) or the
+        // prior submit's backdrop is still valid.
+        if run_backdrop {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("frostify.backdrop pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -318,8 +422,8 @@ impl GpuContext {
                 depth_stencil_attachment: None,
                 timestamp_writes: timing_qs.map(|qs| wgpu::RenderPassTimestampWrites {
                     query_set: qs,
-                    beginning_of_pass_write_index: Some(0),
-                    end_of_pass_write_index: None,
+                    beginning_of_pass_write_index: opaque_begin,
+                    end_of_pass_write_index: opaque_end,
                 }),
                 occlusion_query_set: None,
                 multiview_mask: None,
@@ -333,12 +437,15 @@ impl GpuContext {
         }
 
         // ---- Pass B: separable Gaussian blur ----------------------------
-        // Always runs when glass is present. Skipped if no glass in scene.
-        let has_glass = self.glass_count() > 0;
-        if has_glass {
+        // Same gate as the opaque pass — blur consumes backdrop_tex.
+        if run_backdrop {
             // Radius is fixed stage-1; M9 will key it off per-shape roughness.
             let radius: u32 = 16;
-            self.blur.run(&self.queue, encoder, radius);
+            let blur_timing = match (timing_qs, blur_begin, blur_end) {
+                (Some(qs), Some(b), Some(e)) => Some((qs, b, e)),
+                _ => None,
+            };
+            self.blur.run(&self.queue, encoder, radius, blur_timing);
             self.backdrop_dirty = false;
             drawcalls += 2; // two separable compute dispatches
         }
@@ -359,8 +466,8 @@ impl GpuContext {
                 depth_stencil_attachment: None,
                 timestamp_writes: timing_qs.map(|qs| wgpu::RenderPassTimestampWrites {
                     query_set: qs,
-                    beginning_of_pass_write_index: None,
-                    end_of_pass_write_index: Some(1),
+                    beginning_of_pass_write_index: final_begin,
+                    end_of_pass_write_index: final_end,
                 }),
                 occlusion_query_set: None,
                 multiview_mask: None,
@@ -400,7 +507,11 @@ impl GpuContext {
                         },
                     })],
                     depth_stencil_attachment: None,
-                    timestamp_writes: None,
+                    timestamp_writes: timing_qs.map(|qs| wgpu::RenderPassTimestampWrites {
+                        query_set: qs,
+                        beginning_of_pass_write_index: od_count_begin,
+                        end_of_pass_write_index: od_count_end,
+                    }),
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
@@ -424,7 +535,11 @@ impl GpuContext {
                         },
                     })],
                     depth_stencil_attachment: None,
-                    timestamp_writes: None,
+                    timestamp_writes: timing_qs.map(|qs| wgpu::RenderPassTimestampWrites {
+                        query_set: qs,
+                        beginning_of_pass_write_index: od_compose_begin,
+                        end_of_pass_write_index: od_compose_end,
+                    }),
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
@@ -435,8 +550,8 @@ impl GpuContext {
             }
         }
 
-        if let Some(t) = self.timing.as_ref() {
-            t.encode_resolve(encoder);
+        if let Some(t) = self.timing.as_mut() {
+            t.encode_resolve(encoder, alloc);
         }
 
         self.last_drawcalls = drawcalls;
@@ -472,28 +587,36 @@ impl GpuContext {
         self.encode_frame(&mut encoder, &view);
 
         self.queue.submit(std::iter::once(encoder.finish()));
-        self.read_timing_after_submit();
+        self.poll_timing_after_submit();
         self.window.pre_present_notify();
         frame.present();
     }
 
-    /// Read the resolved timestamp pair from the last submitted frame.
-    /// Stalls the CPU on the GPU. Skipped when timing is unavailable.
-    fn read_timing_after_submit(&mut self) {
-        let Some(t) = self.timing.as_ref() else {
+    /// Kick async map for the slot the most recent `encode_frame` wrote
+    /// into, then non-blocking poll. Updates `last_timing` in-place
+    /// with whatever slot completed this tick (possibly a prior frame).
+    fn poll_timing_after_submit(&mut self) {
+        let Some(t) = self.timing.as_mut() else {
             self.last_timing = None;
             return;
         };
-        self.last_timing = t.read_last(&self.device);
+        t.kick_map_async();
+        t.poll(&self.device);
+        self.last_timing = t.last();
     }
 
     /// Last-frame stats. Drawcall + timing values come from the encoder /
     /// query readback; instance counts mirror the most recent
     /// `set_instances` call.
     pub fn last_frame_stats(&self) -> super::timing::FrameStats {
+        let t = self.last_timing.unwrap_or_default();
         super::timing::FrameStats {
             cpu_ms: 0.0,
-            gpu_ms: self.last_timing.map(|t| t.total_ms).unwrap_or(0.0),
+            gpu_ms: t.total_ms,
+            opaque_ms: t.opaque_ms,
+            blur_ms: t.blur_ms,
+            final_ms: t.final_ms,
+            overdraw_ms: t.overdraw_ms,
             instance_count: self.instance_count,
             opaque_count: self.opaque_count,
             glass_count: self.glass_count(),
@@ -506,6 +629,37 @@ impl GpuContext {
     /// will return a meaningful `gpu_ms`.
     pub fn timing_enabled(&self) -> bool {
         self.timing.is_some()
+    }
+
+    /// Snapshot of currently-allocated GPU-backed memory. Counts the
+    /// instance + overlay SSBOs, blur/overdraw textures, timing
+    /// query/readback buffers, and the CPU-side `prev_instances`
+    /// shadow. Values reflect *allocated* capacity, not in-use size.
+    pub fn memory_report(&self) -> MemoryReport {
+        let stride = std::mem::size_of::<ShapeInstance>() as u64;
+        let (bw, bh) = self.blur.resolution();
+        let blur_px = bw as u64 * bh as u64;
+        // 3 textures (backdrop + tmp + blurred), all Rgba8Unorm → 4 B/px.
+        let blur_textures = blur_px * 4 * 3;
+        let (ow, oh) = self.overdraw.resolution();
+        // 1 texture, Rgba16Float → 8 B/px.
+        let overdraw_textures = (ow as u64) * (oh as u64) * 8;
+        // 2× params uniform buffers, 16 B each (see BlurParams in blur.rs).
+        // Rounded up to a conservative 32 B total — the struct is small
+        // and the allocation alignment rules don't warrant exact
+        // accounting.
+        let params_buffers: u64 = 32;
+        // Timing: 1× resolve (256) + 2× readback (256 each) when active.
+        let timing = if self.timing.is_some() { 256 * 3 } else { 0 };
+        MemoryReport {
+            instance_buffer: self.instance_capacity * stride,
+            overlay_buffer: self.overlay_capacity * stride,
+            prev_instances_cpu: (self.prev_instances.capacity() as u64) * stride,
+            blur_textures,
+            overdraw_textures,
+            timing,
+            params_buffers,
+        }
     }
 
     /// Render one frame into an offscreen RGBA texture and return raw
@@ -575,7 +729,7 @@ impl GpuContext {
             },
         );
         self.queue.submit(std::iter::once(encoder.finish()));
-        self.read_timing_after_submit();
+        self.poll_timing_after_submit();
 
         let slice = readback.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
@@ -612,6 +766,32 @@ impl GpuContext {
         }
 
         (out, width, height)
+    }
+}
+
+/// Breakdown of currently-allocated GPU memory in bytes. Reported
+/// values reflect buffer/texture *capacity*, not in-use counts — this
+/// is a ceiling for debug/profiling, not an exact live watermark.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct MemoryReport {
+    pub instance_buffer: u64,
+    pub overlay_buffer: u64,
+    pub prev_instances_cpu: u64,
+    pub blur_textures: u64,
+    pub overdraw_textures: u64,
+    pub timing: u64,
+    pub params_buffers: u64,
+}
+
+impl MemoryReport {
+    pub fn total(&self) -> u64 {
+        self.instance_buffer
+            + self.overlay_buffer
+            + self.prev_instances_cpu
+            + self.blur_textures
+            + self.overdraw_textures
+            + self.timing
+            + self.params_buffers
     }
 }
 
