@@ -17,7 +17,7 @@ struct ShapeInstance {
     size: vec2<f32>,
     shadow_offset: vec2<f32>,
     shape_kind: u32,
-    roughness: f32,
+    _pad0: f32,
     border_width: f32,
     shadow_blur: f32,
     shadow_opacity: f32,

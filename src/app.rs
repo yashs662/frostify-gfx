@@ -31,24 +31,32 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
 
 use crate::anim::Timeline;
 use crate::debug;
-use crate::gpu::{FrameStats, GpuContext, ShapeInstance};
+use crate::gpu::{FrameStats, GpuContext, ImageHandle, ShapeInstance};
 use crate::input::InputState;
-use crate::node::HitEntry;
-use crate::scene::{ColorBindSlot, Scene, SceneCtx};
+use crate::node::{FlatEvent, HitEntry, WindowAction};
+use crate::scene::{ColorBindSlot, PositionBindSlot, Scene, SceneCtx, SizeBindSlot};
 
-/// Tween-key namespace reserved for the bind registry. User-chosen
-/// keys should stay below this. One key per bind slot index.
-const BIND_TWEEN_KEY_BASE: u32 = 0xC000_0000;
+/// Pixel band on each window edge that triggers a system resize-drag
+/// instead of a normal click. 6 px matches Windows' frameless feel.
+const RESIZE_GUTTER: f32 = 6.0;
+
+/// Tween-key namespaces reserved for the bind registry. One key per
+/// (kind, slot index) pair. User-chosen keys should stay below
+/// `0xC000_0000`. Each kind gets a 16M-slot window — way more than any
+/// realistic scene will ever need.
+const BIND_TWEEN_KEY_COLOR: u32 = 0xC000_0000;
+const BIND_TWEEN_KEY_POSITION: u32 = 0xC100_0000;
+const BIND_TWEEN_KEY_SIZE: u32 = 0xC200_0000;
 
 #[derive(Clone, Debug)]
 pub struct AppConfig {
@@ -75,6 +83,11 @@ impl AppConfig {
     }
 }
 
+enum StagedImage {
+    Png(Vec<u8>),
+    Rgba { w: u32, h: u32, bytes: Vec<u8> },
+}
+
 /// Optional headless script. Called once from `resumed` after the
 /// window is ready and the first frame has been captured. Use it to
 /// drive synthetic input, mutate the tree, advance the timeline by
@@ -92,7 +105,7 @@ pub struct App {
     config: AppConfig,
     ctx: SceneCtx,
     instances: Vec<ShapeInstance>,
-    opaque_count: u32,
+    glass_count: u32,
     hits: Vec<HitEntry>,
     input: InputState,
     timeline: Timeline,
@@ -107,12 +120,53 @@ pub struct App {
     last_dirty_mask: u32,
     /// Wall-clock CPU time of the most recent `render_once` call.
     last_cpu_ms: f32,
+    /// Stats snapshot taken at the end of the most recent `render_once`.
+    /// `save_screenshot` reads from here so the sidecar reflects the
+    /// live render, not the re-encode that `capture_rgba` performs
+    /// (which would clear `backdrop_dirty` and lose drawcall counts).
+    last_render_stats: Option<FrameStats>,
     /// Stat-dump cadence: continuously log on every render when set.
     /// Toggled by `FROSTIFY_STATS=1` env var or by F1 in interactive mode.
     stats_log: bool,
     /// Bar-gauge HUD overlay: enabled by F1 (along with stats logging).
     /// Stage-1 has no text renderer, so the HUD is rect-only.
     hud_enabled: bool,
+    /// Last cursor icon we set on the window — avoid spamming
+    /// `set_cursor` when the cursor stays in the same gutter.
+    last_cursor_icon: CursorIcon,
+    /// Display DPI scale factor. Inputs to layout (`Len::Px`,
+    /// padding, gap, `abs`, font sizes) and to ShapeInstance
+    /// (border_radius, border_width, shadow_*) are in *logical* px
+    /// and multiplied by this on the way to the GPU. Initialised
+    /// from `window.scale_factor()` and refreshed on
+    /// `WindowEvent::ScaleFactorChanged` (drag between monitors).
+    scale_factor: f32,
+    /// Logical inner size in winit-units. Tracked separately so we
+    /// can survive rapid `ScaleFactorChanged` events that arrive
+    /// before the matching `Resized` updates the GPU surface (e.g.
+    /// dragging across a monitor boundary repeatedly).
+    logical_size: [u32; 2],
+    /// Timestamp of the most recent `ScaleFactorChanged`. Any `Resized`
+    /// within a short window after this is treated as DPI-driven (do
+    /// not derive logical from physical). Single-shot flag was too
+    /// fragile: Win11 24H2 (winit#4041) leaks extra Resized events
+    /// from earlier crossings, each of which would otherwise corrupt
+    /// `logical_size` and compound on the next cross.
+    last_dpi_change: Option<Instant>,
+    /// Window outer position captured *before* the most recent
+    /// ScaleFactorChanged. winit's WM_DPICHANGED handler preserves
+    /// the cursor's **logical** offset within the window — when the
+    /// physical width halves (4K→1080p), the window shifts hundreds
+    /// of pixels on screen even though the user is dragging in the
+    /// opposite direction. Browsers preserve the **physical** offset
+    /// (window stays under the hand). We restore this position in
+    /// the next DPI Resized to match that behavior.
+    pre_dpi_outer: Option<winit::dpi::PhysicalPosition<i32>>,
+    /// Images staged for upload at GPU init. Index in this vec equals
+    /// the [`ImageHandle`] returned to the caller — the image atlas
+    /// allocates handles sequentially from 0, so the two stay in
+    /// lock-step as long as we drain in order.
+    staged_images: Vec<StagedImage>,
     // Lazy:
     window: Option<Arc<Window>>,
     gpu: Option<GpuContext>,
@@ -124,7 +178,7 @@ impl App {
             config: AppConfig::new(title, width, height),
             ctx: SceneCtx::new(),
             instances: Vec::new(),
-            opaque_count: 0,
+            glass_count: 0,
             hits: Vec::new(),
             input: InputState::new(),
             timeline: Timeline::new(),
@@ -133,11 +187,39 @@ impl App {
             capture_frames: None,
             last_dirty_mask: 0,
             last_cpu_ms: 0.0,
+            last_render_stats: None,
             stats_log: std::env::var_os("FROSTIFY_STATS").is_some(),
             hud_enabled: std::env::var_os("FROSTIFY_HUD").is_some(),
+            last_cursor_icon: CursorIcon::Default,
+            scale_factor: 1.0,
+            logical_size: [width, height],
+            last_dpi_change: None,
+            pre_dpi_outer: None,
+            staged_images: Vec::new(),
             window: None,
             gpu: None,
         }
+    }
+
+    /// Stage a PNG byte slice for upload to the image atlas. Returns
+    /// a virtual handle that the scene closure can use immediately;
+    /// the decode + upload runs at GPU init. `include_bytes!(...)` is
+    /// the typical source. Reuse the same handle in multiple
+    /// `Scene::image(...)` calls.
+    pub fn stage_image_png(&mut self, bytes: impl Into<Vec<u8>>) -> ImageHandle {
+        let id = self.staged_images.len() as u32;
+        self.staged_images.push(StagedImage::Png(bytes.into()));
+        ImageHandle(id)
+    }
+
+    /// Stage pre-decoded `Rgba8UnormSrgb` pixels (`w*h*4` bytes,
+    /// row-major, top-left origin). Same scheduling as
+    /// [`Self::stage_image_png`].
+    pub fn stage_image_rgba(&mut self, w: u32, h: u32, bytes: Vec<u8>) -> ImageHandle {
+        let id = self.staged_images.len() as u32;
+        self.staged_images
+            .push(StagedImage::Rgba { w, h, bytes });
+        ImageHandle(id)
     }
 
     /// Run the user-supplied scene builder. Mutates the inner
@@ -166,6 +248,7 @@ impl App {
         self.config.capture_dir = dir.into();
         self
     }
+
 
     /// Capture `frames` still snapshots of the initial scene under
     /// `capture_dir` and exit. For scripted scenarios that mutate
@@ -248,15 +331,41 @@ impl App {
             return false;
         }
         self.last_dirty_mask = mask;
-        let (flat, opaque_count, hits) = self.ctx.tree.flatten();
-        self.instances = flat;
-        self.opaque_count = opaque_count;
+        if mask & (crate::node::dirty::TREE | crate::node::dirty::TRANSFORM) != 0 {
+            let viewport = self.viewport();
+            crate::layout::compute_layout(
+                &mut self.ctx.tree,
+                viewport,
+                &mut self.ctx.text,
+                self.scale_factor,
+            );
+        }
+        let (events, hits) = self.ctx.tree.flatten();
         self.hits = hits;
         let backdrop_hint = mask & crate::node::dirty::BACKDROP != 0;
         if let Some(gpu) = self.gpu.as_mut() {
-            gpu.set_instances(&self.instances, self.opaque_count, backdrop_hint);
+            self.instances.clear();
+            self.glass_count = expand_events_into(
+                &events,
+                &mut self.instances,
+                gpu,
+                &mut self.ctx.text,
+                self.scale_factor,
+            );
+            gpu.set_instances(&self.instances, self.glass_count, backdrop_hint);
         }
         true
+    }
+
+    fn viewport(&self) -> [f32; 2] {
+        if let Some(g) = self.gpu.as_ref() {
+            [
+                g.surface_config.width as f32,
+                g.surface_config.height as f32,
+            ]
+        } else {
+            [self.config.width as f32, self.config.height as f32]
+        }
     }
 
     fn request_redraw(&self) {
@@ -275,18 +384,21 @@ impl App {
         let t0 = Instant::now();
         gpu.render_frame();
         self.last_cpu_ms = t0.elapsed().as_secs_f32() * 1_000.0;
+        let snapshot = self.current_stats();
+        self.last_render_stats = Some(snapshot);
         if self.stats_log {
-            log::info!("frame stats: {:?}", self.current_stats());
+            log::info!("frame stats: {snapshot:?}");
         }
     }
 
-    /// Build a small set of debug rectangles representing the most
-    /// recent frame stats and upload them as overlay instances. Cleared
-    /// when `hud_enabled` flips off.
+    /// Build a numeric-label HUD from the most recent frame stats and
+    /// upload it as overlay instances. Cleared when `hud_enabled` flips
+    /// off.
     fn refresh_hud_overlay(&mut self) {
         let stats = self.current_stats();
-        let instances = build_hud_instances(&stats);
+        let scale = self.scale_factor;
         if let Some(gpu) = self.gpu.as_mut() {
+            let instances = build_hud_instances(&stats, gpu, &mut self.ctx.text, scale);
             gpu.set_overlay_instances(&instances);
         }
     }
@@ -324,15 +436,37 @@ impl App {
             &mut self.timeline,
             now,
         );
+        process_position_binds(
+            &mut self.ctx.binds.position,
+            &mut self.ctx.tree,
+            &mut self.timeline,
+            now,
+        );
+        process_size_binds(
+            &mut self.ctx.binds.size,
+            &mut self.ctx.tree,
+            &mut self.timeline,
+            now,
+        );
     }
 
-    /// For animated color binds, copy the current `displayed` signal
-    /// value (driven by the timeline) into the tree. Called after
-    /// every timeline tick.
+    /// For animated binds, copy the current `displayed` signal value
+    /// (driven by the timeline) into the tree. Called after every
+    /// timeline tick.
     fn pump_animated_displays(&mut self) {
         for slot in &self.ctx.binds.color {
             if let Some(disp) = &slot.displayed {
                 self.ctx.tree.set_color(slot.node_id, disp.get());
+            }
+        }
+        for slot in &self.ctx.binds.position {
+            if let Some(disp) = &slot.displayed {
+                self.ctx.tree.set_layout_pos_abs(slot.node_id, disp.get());
+            }
+        }
+        for slot in &self.ctx.binds.size {
+            if let Some(disp) = &slot.displayed {
+                self.ctx.tree.set_layout_size_px(slot.node_id, disp.get());
             }
         }
     }
@@ -347,6 +481,96 @@ impl App {
         }
     }
 
+    /// Resize gutter hit-test. Returns the direction whose gutter
+    /// contains `(x, y)`, or `None` if the cursor is in the interior.
+    /// Skipped entirely when the window is maximised — Windows refuses
+    /// to start a resize drag in that state anyway.
+    fn edge_at(&self, x: f32, y: f32) -> Option<ResizeDirection> {
+        let win = self.window.as_ref()?;
+        if win.is_maximized() {
+            return None;
+        }
+        let g = self.gpu.as_ref()?;
+        let w = g.surface_config.width as f32;
+        let h = g.surface_config.height as f32;
+        let l = x < RESIZE_GUTTER;
+        let r = x > w - RESIZE_GUTTER;
+        let t = y < RESIZE_GUTTER;
+        let b = y > h - RESIZE_GUTTER;
+        match (t, b, l, r) {
+            (true, _, true, _) => Some(ResizeDirection::NorthWest),
+            (true, _, _, true) => Some(ResizeDirection::NorthEast),
+            (_, true, true, _) => Some(ResizeDirection::SouthWest),
+            (_, true, _, true) => Some(ResizeDirection::SouthEast),
+            (true, _, _, _) => Some(ResizeDirection::North),
+            (_, true, _, _) => Some(ResizeDirection::South),
+            (_, _, true, _) => Some(ResizeDirection::West),
+            (_, _, _, true) => Some(ResizeDirection::East),
+            _ => None,
+        }
+    }
+
+    /// Look up the [`WindowAction`] tagged on the currently hovered
+    /// node, if any.
+    fn hovered_window_action(&self) -> Option<WindowAction> {
+        let id = self.input.hovered?;
+        self.ctx.tree.get(id).and_then(|n| n.window_action)
+    }
+
+    /// Pick the right cursor icon for `(x, y)` and push it to the
+    /// window if it changed. Edge gutters win over node hover so the
+    /// title bar's drag cursor doesn't fight the corner-resize cursor.
+    fn refresh_cursor(&mut self, x: f32, y: f32) {
+        let icon = if let Some(dir) = self.edge_at(x, y) {
+            CursorIcon::from(dir)
+        } else if let Some(action) = self.hovered_window_action() {
+            match action {
+                WindowAction::DragMove => CursorIcon::Move,
+                WindowAction::Close
+                | WindowAction::Minimize
+                | WindowAction::ToggleMaximize => CursorIcon::Pointer,
+            }
+        } else {
+            CursorIcon::Default
+        };
+        if icon == self.last_cursor_icon {
+            return;
+        }
+        self.last_cursor_icon = icon;
+        if let Some(w) = &self.window {
+            w.set_cursor(icon);
+        }
+    }
+
+    /// Dispatch a window action to winit. Returns true if the action
+    /// was a window-drag (so the caller should also skip the normal
+    /// press → on_left_pressed path).
+    fn dispatch_window_action(
+        &mut self,
+        action: WindowAction,
+        event_loop: &ActiveEventLoop,
+    ) -> bool {
+        let Some(win) = &self.window else { return false };
+        match action {
+            WindowAction::DragMove => {
+                let _ = win.drag_window();
+                true
+            }
+            WindowAction::Close => {
+                event_loop.exit();
+                true
+            }
+            WindowAction::Minimize => {
+                win.set_minimized(true);
+                true
+            }
+            WindowAction::ToggleMaximize => {
+                win.set_maximized(!win.is_maximized());
+                true
+            }
+        }
+    }
+
     fn save_screenshot(&mut self) {
         let Some(gpu) = self.gpu.as_mut() else {
             return;
@@ -357,76 +581,139 @@ impl App {
             Ok(()) => log::info!("screenshot saved: {}", path.display()),
             Err(e) => log::error!("screenshot failed: {e}"),
         }
-        let stats = self.current_stats();
+        let stats = self
+            .last_render_stats
+            .unwrap_or_else(|| self.current_stats());
         debug::write_stats_sidecar(&path, &stats);
     }
 }
 
-/// Bar-gauge HUD layout. Stage-1 is rect-only — see PLAN.md "no text"
-/// rule. Each metric gets a horizontal bar; the fill width is a
-/// fraction (0..=1) of a per-metric reference cap. Color shifts from
-/// green → yellow → red as the fraction crosses 0.5 / 0.8.
-fn build_hud_instances(stats: &FrameStats) -> Vec<ShapeInstance> {
-    const ORIGIN_X: f32 = 12.0;
-    const ORIGIN_Y: f32 = 12.0;
-    const BAR_W: f32 = 200.0;
-    const BAR_H: f32 = 10.0;
-    const BAR_GAP: f32 = 6.0;
-    const PAD: f32 = 8.0;
+/// Walk an ordered event list, expanding Text/Image events into GPU
+/// instances at their declared position. Preserves painter's order
+/// across all kinds so glass, text, images and rects can be layered
+/// in any order. Returns the count of `SHAPE_KIND_GLASS` instances
+/// produced (used by `gpu.set_instances` for stats and the
+/// backdrop-pass gate).
+fn expand_events_into(
+    events: &[FlatEvent],
+    out: &mut Vec<ShapeInstance>,
+    gpu: &mut crate::gpu::GpuContext,
+    text: &mut crate::text::TextResources,
+    scale: f32,
+) -> u32 {
+    use crate::gpu::SHAPE_KIND_GLASS;
+    let mut glass_count: u32 = 0;
+    for event in events {
+        match event {
+            FlatEvent::Shape(s) => {
+                let mut s = *s;
+                if s.shape_kind == SHAPE_KIND_GLASS {
+                    glass_count += 1;
+                }
+                // border_radius/border_width/shadow_offset/shadow_blur
+                // are stored in logical px on the style. Position +
+                // size already came out of layout in physical px.
+                s.border_radius = [
+                    s.border_radius[0] * scale,
+                    s.border_radius[1] * scale,
+                    s.border_radius[2] * scale,
+                    s.border_radius[3] * scale,
+                ];
+                s.border_width *= scale;
+                s.shadow_offset = [s.shadow_offset[0] * scale, s.shadow_offset[1] * scale];
+                s.shadow_blur *= scale;
+                if s.shape_kind == SHAPE_KIND_GLASS {
+                    // For glass: x = blur_amount (px), y = refraction (px).
+                    // Both authored in logical px, scaled to physical.
+                    s.backdrop_uv_rect[0] *= scale;
+                    s.backdrop_uv_rect[1] *= scale;
+                }
+                out.push(s);
+            }
+            FlatEvent::Image(r) => {
+                let mut r = r.clone();
+                r.border_radius = [
+                    r.border_radius[0] * scale,
+                    r.border_radius[1] * scale,
+                    r.border_radius[2] * scale,
+                    r.border_radius[3] * scale,
+                ];
+                let resolved = gpu.build_image_instances(std::slice::from_ref(&r));
+                out.extend(resolved);
+            }
+            FlatEvent::Text(r) => {
+                // font_size + line_height in TextRef are logical;
+                // shaping needs physical px so the glyph atlas
+                // rasterizes at on-screen resolution.
+                let mut r = r.clone();
+                r.font_size *= scale;
+                r.line_height *= scale;
+                let glyphs = gpu.build_glyph_instances(text, std::slice::from_ref(&r));
+                out.extend(glyphs);
+            }
+        }
+    }
+    glass_count
+}
 
-    let metrics = [
-        ("cpu", stats.cpu_ms / 16.6),
-        ("gpu", stats.gpu_ms / 16.6),
-        ("inst", stats.instance_count as f32 / 256.0),
-        ("draw", stats.drawcalls as f32 / 16.0),
+/// Numeric-label HUD. One row per metric: "<label> <value>". Uses the
+/// glyph atlas on `gpu` so shaping + atlas upload happen here.
+fn build_hud_instances(
+    stats: &FrameStats,
+    gpu: &mut crate::gpu::GpuContext,
+    text: &mut crate::text::TextResources,
+    scale: f32,
+) -> Vec<ShapeInstance> {
+    use crate::node::TextRef;
+
+    // All values declared in logical px (matches the scene-graph
+    // convention) and multiplied by the display scale before they
+    // hit the GPU. Keeps the HUD on-screen footprint identical
+    // across 100% / 200% monitors.
+    let origin_x = 12.0 * scale;
+    let origin_y = 12.0 * scale;
+    let pad = 8.0 * scale;
+    let line_h = 14.0 * scale;
+    let font_size = 12.0 * scale;
+    let panel_w = 160.0 * scale;
+    let radius = 6.0 * scale;
+
+    let lines: [String; 6] = [
+        format!("cpu  {:>5.2} ms", stats.cpu_ms),
+        format!("gpu  {:>5.2} ms", stats.gpu_ms),
+        format!("opq  {:>5.2} ms", stats.opaque_ms),
+        format!("fnl  {:>5.2} ms", stats.final_ms),
+        format!("inst {:>5}", stats.instance_count),
+        format!("draw {:>5}", stats.drawcalls),
     ];
 
-    let panel_w = BAR_W + PAD * 2.0;
-    let panel_h = (BAR_H + BAR_GAP) * metrics.len() as f32 + PAD * 2.0 - BAR_GAP;
+    let panel_h = pad * 2.0 + line_h * lines.len() as f32;
+    let mut out = Vec::with_capacity(1 + lines.len() * 12);
 
-    let mut out = Vec::with_capacity(1 + metrics.len() * 2);
-
-    // Background panel.
     out.push(ShapeInstance {
         color: [0.0, 0.0, 0.0, 0.6],
-        position: [ORIGIN_X, ORIGIN_Y],
+        position: [origin_x, origin_y],
         size: [panel_w, panel_h],
-        border_radius: [6.0; 4],
+        border_radius: [radius; 4],
         ..Default::default()
     });
 
-    for (i, (_, frac)) in metrics.iter().enumerate() {
-        let bar_y = ORIGIN_Y + PAD + i as f32 * (BAR_H + BAR_GAP);
-        let bar_x = ORIGIN_X + PAD;
-        // Bar background.
-        out.push(ShapeInstance {
-            color: [1.0, 1.0, 1.0, 0.10],
-            position: [bar_x, bar_y],
-            size: [BAR_W, BAR_H],
-            border_radius: [3.0; 4],
-            ..Default::default()
-        });
-        // Bar fill.
-        let f = frac.clamp(0.0, 1.0);
-        let fill_w = (BAR_W * f).max(0.0);
-        let color = if f < 0.5 {
-            [0.30, 0.85, 0.40, 1.0]
-        } else if f < 0.8 {
-            [0.95, 0.80, 0.20, 1.0]
-        } else {
-            [0.95, 0.30, 0.30, 1.0]
-        };
-        if fill_w > 0.0 {
-            out.push(ShapeInstance {
-                color,
-                position: [bar_x, bar_y],
-                size: [fill_w, BAR_H],
-                border_radius: [3.0; 4],
-                ..Default::default()
-            });
-        }
-    }
-
+    let refs: Vec<TextRef> = lines
+        .iter()
+        .enumerate()
+        .map(|(i, s)| TextRef {
+            position: [origin_x + pad, origin_y + pad + i as f32 * line_h],
+            color: [1.0, 1.0, 1.0, 1.0],
+            opacity: 1.0,
+            content: s.clone(),
+            // HUD font_size + line_height already in physical px so
+            // build_glyph_instances ships them straight to the
+            // shaper — match that calling convention.
+            font_size,
+            line_height: line_h,
+        })
+        .collect();
+    out.extend(gpu.build_glyph_instances(text, &refs));
     out
 }
 
@@ -449,10 +736,56 @@ fn process_color_binds(
         let target = slot.bind.read();
         if let (Some(disp), Some((curve, dur))) = (slot.displayed.as_ref(), slot.bind.animation())
         {
-            let key = BIND_TWEEN_KEY_BASE + idx as u32;
+            let key = BIND_TWEEN_KEY_COLOR + idx as u32;
             timeline.start(key, disp.clone(), target, curve, dur, now);
         } else {
             tree.set_color(slot.node_id, target);
+        }
+    }
+}
+
+fn process_position_binds(
+    slots: &mut [PositionBindSlot],
+    tree: &mut crate::node::NodeTree,
+    timeline: &mut Timeline,
+    now: Instant,
+) {
+    for (idx, slot) in slots.iter_mut().enumerate() {
+        let v = slot.bind.version();
+        if v == slot.last_version {
+            continue;
+        }
+        slot.last_version = v;
+        let target = slot.bind.read();
+        if let (Some(disp), Some((curve, dur))) = (slot.displayed.as_ref(), slot.bind.animation())
+        {
+            let key = BIND_TWEEN_KEY_POSITION + idx as u32;
+            timeline.start(key, disp.clone(), target, curve, dur, now);
+        } else {
+            tree.set_layout_pos_abs(slot.node_id, target);
+        }
+    }
+}
+
+fn process_size_binds(
+    slots: &mut [SizeBindSlot],
+    tree: &mut crate::node::NodeTree,
+    timeline: &mut Timeline,
+    now: Instant,
+) {
+    for (idx, slot) in slots.iter_mut().enumerate() {
+        let v = slot.bind.version();
+        if v == slot.last_version {
+            continue;
+        }
+        slot.last_version = v;
+        let target = slot.bind.read();
+        if let (Some(disp), Some((curve, dur))) = (slot.displayed.as_ref(), slot.bind.animation())
+        {
+            let key = BIND_TWEEN_KEY_SIZE + idx as u32;
+            timeline.start(key, disp.clone(), target, curve, dur, now);
+        } else {
+            tree.set_layout_size_px(slot.node_id, target);
         }
     }
 }
@@ -467,9 +800,18 @@ pub struct HeadlessHelper<'a> {
     pub input: &'a mut InputState,
     pub timeline: &'a mut Timeline,
     pub instances: &'a mut Vec<ShapeInstance>,
-    pub opaque_count: &'a mut u32,
+    pub glass_count: &'a mut u32,
     pub hits: &'a mut Vec<HitEntry>,
     pub capture_dir: &'a Path,
+    /// Stats snapshot taken at end of `render()`. `capture()` reads
+    /// from here so the sidecar describes the live render frame, not
+    /// the re-encode that `capture_rgba` performs.
+    pub last_render_stats: &'a mut Option<FrameStats>,
+    /// Display DPI scale factor — applied to layout + text the same
+    /// way as `App` does. Defaults to `1.0` for headless captures
+    /// (no real window). Override before calling `flush` if a
+    /// scripted scenario needs to test scaled rendering.
+    pub scale_factor: f32,
 }
 
 impl<'a> HeadlessHelper<'a> {
@@ -480,18 +822,41 @@ impl<'a> HeadlessHelper<'a> {
         if mask == 0 {
             return false;
         }
-        let (flat, opaque_count, hits) = self.ctx.tree.flatten();
-        *self.instances = flat;
-        *self.opaque_count = opaque_count;
+        if mask & (crate::node::dirty::TREE | crate::node::dirty::TRANSFORM) != 0 {
+            let vp = [
+                self.gpu.surface_config.width as f32,
+                self.gpu.surface_config.height as f32,
+            ];
+            crate::layout::compute_layout(
+                &mut self.ctx.tree,
+                vp,
+                &mut self.ctx.text,
+                self.scale_factor,
+            );
+        }
+        let (events, hits) = self.ctx.tree.flatten();
         *self.hits = hits;
+        self.instances.clear();
+        *self.glass_count = expand_events_into(
+            &events,
+            self.instances,
+            self.gpu,
+            &mut self.ctx.text,
+            self.scale_factor,
+        );
         let backdrop_hint = mask & crate::node::dirty::BACKDROP != 0;
         self.gpu
-            .set_instances(self.instances, *self.opaque_count, backdrop_hint);
+            .set_instances(self.instances, *self.glass_count, backdrop_hint);
         true
     }
 
     pub fn render(&mut self) {
         self.gpu.render_frame();
+        // Snapshot the render-frame stats before any subsequent
+        // `capture()` re-encodes and clears `backdrop_dirty`.
+        let mut snap = self.gpu.last_frame_stats();
+        snap.dirty_mask = 0;
+        *self.last_render_stats = Some(snap);
     }
 
     pub fn capture(&mut self) {
@@ -501,16 +866,18 @@ impl<'a> HeadlessHelper<'a> {
             Ok(()) => log::info!("auto-capture saved: {}", path.display()),
             Err(e) => log::error!("auto-capture failed: {e}"),
         }
-        let mut stats = self.gpu.last_frame_stats();
-        // CPU ms isn't tracked here — capture path is non-hot. Leave at 0.0.
-        stats.dirty_mask = 0;
+        let stats = self.last_render_stats.unwrap_or_else(|| {
+            let mut s = self.gpu.last_frame_stats();
+            s.dirty_mask = 0;
+            s
+        });
         debug::write_stats_sidecar(&path, &stats);
     }
 
     /// Fast-forward every active tween to its target, push the
     /// settled values through the bind registry, and clear the
     /// timeline. Useful after a scripted state change so the next
-    /// capture reflects the destination color rather than the
+    /// capture reflects the destination value rather than the
     /// pre-tween value.
     pub fn settle(&mut self) {
         if !self.timeline.active() {
@@ -526,13 +893,23 @@ impl<'a> HeadlessHelper<'a> {
                 self.ctx.tree.set_color(slot.node_id, disp.get());
             }
         }
+        for slot in &self.ctx.binds.position {
+            if let Some(disp) = &slot.displayed {
+                self.ctx.tree.set_layout_pos_abs(slot.node_id, disp.get());
+            }
+        }
+        for slot in &self.ctx.binds.size {
+            if let Some(disp) = &slot.displayed {
+                self.ctx.tree.set_layout_size_px(slot.node_id, disp.get());
+            }
+        }
     }
 
-    /// Build + upload the bar-gauge HUD overlay from the renderer's
-    /// most recent frame stats. Calls `set_overlay_instances`.
+    /// Build + upload the numeric-label HUD overlay from the
+    /// renderer's most recent frame stats.
     pub fn show_hud(&mut self) {
         let stats = self.gpu.last_frame_stats();
-        let inst = build_hud_instances(&stats);
+        let inst = build_hud_instances(&stats, self.gpu, &mut self.ctx.text, self.scale_factor);
         self.gpu.set_overlay_instances(&inst);
     }
 
@@ -550,9 +927,31 @@ impl<'a> HeadlessHelper<'a> {
             self.timeline,
             now,
         );
+        process_position_binds(
+            &mut self.ctx.binds.position,
+            &mut self.ctx.tree,
+            self.timeline,
+            now,
+        );
+        process_size_binds(
+            &mut self.ctx.binds.size,
+            &mut self.ctx.tree,
+            self.timeline,
+            now,
+        );
         for slot in &self.ctx.binds.color {
             if let Some(disp) = &slot.displayed {
                 self.ctx.tree.set_color(slot.node_id, disp.get());
+            }
+        }
+        for slot in &self.ctx.binds.position {
+            if let Some(disp) = &slot.displayed {
+                self.ctx.tree.set_layout_pos_abs(slot.node_id, disp.get());
+            }
+        }
+        for slot in &self.ctx.binds.size {
+            if let Some(disp) = &slot.displayed {
+                self.ctx.tree.set_layout_size_px(slot.node_id, disp.get());
             }
         }
     }
@@ -572,25 +971,60 @@ impl ApplicationHandler for App {
             .with_resizable(true)
             .with_blur(self.config.blur)
             .with_visible(false)
-            .with_inner_size(winit::dpi::PhysicalSize::new(
-                self.config.width,
-                self.config.height,
+            // Logical size — winit converts to physical based on the
+            // monitor's scale factor, so the same `AppConfig::new(w, h)`
+            // produces the same on-screen footprint on a 100% 1080p
+            // display and a 200% 4k display.
+            .with_inner_size(winit::dpi::LogicalSize::new(
+                self.config.width as f64,
+                self.config.height as f64,
             ));
         let window = event_loop
             .create_window(attrs)
             .expect("failed to create window");
         let window_arc: Arc<Window> = Arc::new(window);
+        self.scale_factor = window_arc.scale_factor() as f32;
+        // Seed logical_size from the actual window — winit may have
+        // adjusted to fit the monitor or the minimum chrome size.
+        let phys = window_arc.inner_size();
+        let s = self.scale_factor.max(f32::EPSILON);
+        self.logical_size = [
+            (phys.width as f32 / s).round() as u32,
+            (phys.height as f32 / s).round() as u32,
+        ];
         self.gpu = Some(GpuContext::new(Arc::clone(&window_arc)));
         self.window = Some(window_arc);
+        log::info!("display scale: {}", self.scale_factor);
+
+        // Drain staged PNGs into the image atlas. The atlas allocates
+        // handles sequentially from 0, matching the indices we handed
+        // back from `stage_image_png`.
+        if !self.staged_images.is_empty() {
+            let gpu = self.gpu.as_mut().expect("gpu just initialized");
+            let staged = std::mem::take(&mut self.staged_images);
+            for (idx, image) in staged.into_iter().enumerate() {
+                let ok = match image {
+                    StagedImage::Png(bytes) => gpu.upload_image_png(&bytes).is_some(),
+                    StagedImage::Rgba { w, h, bytes } => {
+                        gpu.image_atlas.upload_rgba(&gpu.queue, w, h, &bytes).is_some()
+                    }
+                };
+                if !ok {
+                    log::warn!("staged image #{idx}: decode/upload failed");
+                }
+            }
+        }
 
         if let Some(mem) = self.memory_report() {
             log::info!(
-                "gpu memory: total={} KiB (instance={} overlay={} blur={} overdraw={} timing={} prev_cpu={})",
+                "gpu memory: total={} KiB (instance={} overlay={} blur={} overdraw={} glyph_atlas={} image_atlas={} timing={} prev_cpu={})",
                 mem.total() / 1024,
                 mem.instance_buffer,
                 mem.overlay_buffer,
                 mem.blur_textures,
                 mem.overdraw_textures,
+                mem.glyph_atlas,
+                mem.image_atlas,
                 mem.timing,
                 mem.prev_instances_cpu,
             );
@@ -626,9 +1060,11 @@ impl ApplicationHandler for App {
                 input: &mut self.input,
                 timeline: &mut self.timeline,
                 instances: &mut self.instances,
-                opaque_count: &mut self.opaque_count,
+                glass_count: &mut self.glass_count,
                 hits: &mut self.hits,
                 capture_dir: &self.config.capture_dir,
+                last_render_stats: &mut self.last_render_stats,
+                scale_factor: self.scale_factor,
             };
             script(&mut helper);
             event_loop.exit();
@@ -655,7 +1091,76 @@ impl ApplicationHandler for App {
                 if let Some(g) = self.gpu.as_mut() {
                     g.resize(size.width, size.height);
                 }
+                let in_dpi_window = self
+                    .last_dpi_change
+                    .map(|t| t.elapsed() < Duration::from_millis(500))
+                    .unwrap_or(false);
+                let want_w = (self.logical_size[0] as f32 * self.scale_factor)
+                    .round() as u32;
+                let want_h = (self.logical_size[1] as f32 * self.scale_factor)
+                    .round() as u32;
+                if in_dpi_window {
+                    // DPI-triggered resize. Keep logical_size; Win11
+                    // 24H2 may deliver stale physical here.
+                    let mismatch = size.width != want_w || size.height != want_h;
+                    if mismatch && let Some(w) = &self.window {
+                        log::warn!(
+                            "DPI Resized {}x{} ≠ logical*scale {}x{}, forcing back (winit#4041)",
+                            size.width,
+                            size.height,
+                            want_w,
+                            want_h
+                        );
+                        let _ = w.request_inner_size(winit::dpi::PhysicalSize::new(
+                            want_w, want_h,
+                        ));
+                    }
+                    // Cancel winit's cursor-anchored reposition —
+                    // restore pre-SF outer so the window stays under
+                    // the cursor physically (matches browser
+                    // behavior).
+                    if let Some(p) = self.pre_dpi_outer.take()
+                        && let Some(w) = &self.window
+                        && w.outer_position().ok() != Some(p)
+                    {
+                        w.set_outer_position(p);
+                    }
+                } else if size.width != want_w || size.height != want_h {
+                    // User-driven resize (drag handle / snap / max).
+                    let s = self.scale_factor.max(f32::EPSILON);
+                    self.logical_size = [
+                        (size.width as f32 / s).round() as u32,
+                        (size.height as f32 / s).round() as u32,
+                    ];
+                }
+                // Viewport size feeds layout (Fill/Pct/Fr + glass
+                // backdrop region). Reflow + re-upload at the new size.
+                self.ctx.tree.mark_all_dirty();
+                self.flush_tree();
                 self.request_redraw();
+            }
+            WindowEvent::ScaleFactorChanged {
+                scale_factor,
+                inner_size_writer: _,
+            } => {
+                let new_scale = scale_factor as f32;
+                if (new_scale - self.scale_factor).abs() > f32::EPSILON {
+                    log::debug!(
+                        "scale factor: {} → {}",
+                        self.scale_factor,
+                        new_scale
+                    );
+                    if let Some(w) = &self.window
+                        && let Ok(p) = w.outer_position()
+                    {
+                        self.pre_dpi_outer = Some(p);
+                    }
+                    self.last_dpi_change = Some(Instant::now());
+                    self.scale_factor = new_scale;
+                    if let Some(g) = self.gpu.as_mut() {
+                        g.reset_glyph_atlas();
+                    }
+                }
             }
             WindowEvent::RedrawRequested => {
                 self.render_once();
@@ -671,12 +1176,19 @@ impl ApplicationHandler for App {
                 let change =
                     self.input
                         .on_cursor_moved(x, y, &self.hits, &self.ctx.tree);
+                self.refresh_cursor(x, y);
                 if change.any() {
                     self.react();
                 }
             }
             WindowEvent::CursorLeft { .. } => {
                 let change = self.input.on_cursor_left(&self.hits, &self.ctx.tree);
+                if self.last_cursor_icon != CursorIcon::Default {
+                    self.last_cursor_icon = CursorIcon::Default;
+                    if let Some(w) = &self.window {
+                        w.set_cursor(CursorIcon::Default);
+                    }
+                }
                 if change.any() {
                     self.react();
                 }
@@ -686,6 +1198,19 @@ impl ApplicationHandler for App {
                 button: MouseButton::Left,
                 ..
             } => {
+                if state == ElementState::Pressed {
+                    if let Some([cx, cy]) = self.input.cursor
+                        && let Some(dir) = self.edge_at(cx, cy) {
+                            if let Some(w) = &self.window {
+                                let _ = w.drag_resize_window(dir);
+                            }
+                            return;
+                        }
+                    if let Some(action) = self.hovered_window_action()
+                        && self.dispatch_window_action(action, event_loop) {
+                            return;
+                        }
+                }
                 let change = match state {
                     ElementState::Pressed => {
                         self.input.on_left_pressed(&self.hits, &self.ctx.tree)

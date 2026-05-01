@@ -149,14 +149,13 @@ fn sync_bool_signals(
 ) -> bool {
     let mut changed = false;
     for entry in hits {
-        if let Some(n) = tree.get(entry.node_id) {
-            if let Some(sig) = select(n).as_ref() {
+        if let Some(n) = tree.get(entry.node_id)
+            && let Some(sig) = select(n).as_ref() {
                 let on = Some(entry.node_id) == target;
                 if sig.set(on) {
                     changed = true;
                 }
             }
-        }
     }
     changed
 }

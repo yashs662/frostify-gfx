@@ -1,11 +1,12 @@
-//! Pipeline construction for the M4 shape passes.
+//! Pipeline construction for the shape passes.
 //!
 //! Two render pipelines share one shader module:
 //!   - `opaque_pipeline`: fs_opaque, targets `BACKDROP_FORMAT`. Only uses
 //!     bind group 0 (frame + instances). Drawn into the backdrop texture.
 //!   - `final_pipeline`: fs_main, targets the swapchain format. Uses
-//!     bind group 0 + bind group 1 (blurred texture + sampler). Drawn to
-//!     the surface; glass instances sample the blurred backdrop.
+//!     bind group 0 + bind group 1 (backdrop pyramid + sampler) +
+//!     glyph and image atlases. Drawn to the surface; glass instances
+//!     sample the backdrop via dual-filter upsample at a per-instance LOD.
 
 use wgpu::util::DeviceExt;
 
@@ -21,7 +22,12 @@ pub struct ShapePipeline {
 }
 
 impl ShapePipeline {
-    pub fn new(device: &wgpu::Device, surface_format: wgpu::TextureFormat) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        surface_format: wgpu::TextureFormat,
+        glyph_bgl: &wgpu::BindGroupLayout,
+        image_bgl: &wgpu::BindGroupLayout,
+    ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("frostify.shape shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/shape.wgsl").into()),
@@ -79,17 +85,32 @@ impl ShapePipeline {
             ],
         });
 
-        // Opaque pipeline layout: only bind group 0.
+        // Opaque pipeline layout: groups 0 (shape) + 2 (glyph) + 3
+        // (image). Group 1 stays unbound — `fs_opaque` doesn't sample
+        // the blurred backdrop (it writes its source). Glyph + image
+        // atlases are independent textures so they're safe to bind in
+        // both passes; this lets text and images participate in the
+        // backdrop and appear blurred behind glass panels.
         let opaque_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("frostify.shape.opaque pl"),
-            bind_group_layouts: &[Some(&shape_bgl)],
+            bind_group_layouts: &[
+                Some(&shape_bgl),
+                None,
+                Some(glyph_bgl),
+                Some(image_bgl),
+            ],
             immediate_size: 0,
         });
 
-        // Final pipeline layout: bind groups 0 and 1.
+        // Final pipeline layout: bind groups 0..=3.
         let final_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("frostify.shape.final pl"),
-            bind_group_layouts: &[Some(&shape_bgl), Some(&glass_bgl)],
+            bind_group_layouts: &[
+                Some(&shape_bgl),
+                Some(&glass_bgl),
+                Some(glyph_bgl),
+                Some(image_bgl),
+            ],
             immediate_size: 0,
         });
 
@@ -155,7 +176,8 @@ impl ShapePipeline {
             label: Some("frostify.frame ubo"),
             contents: bytemuck::bytes_of(&FrameUniform {
                 screen_size: [1.0, 1.0],
-                _pad: [0.0; 2],
+                max_backdrop_lod: 0.0,
+                _pad: 0.0,
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });

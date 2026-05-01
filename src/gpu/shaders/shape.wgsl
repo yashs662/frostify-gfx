@@ -1,18 +1,20 @@
-// SDF pipeline for M4 shapes: rounded rectangles with per-corner radii,
-// borders, drop shadows, plus frosted-glass shapes that sample a
-// pre-blurred backdrop texture. Outputs PREMULTIPLIED alpha — pair with
-// blend state One / OneMinusSrcAlpha and a PreMultiplied surface
-// composite mode.
+// SDF pipeline: rounded rectangles with per-corner radii, borders, drop
+// shadows, plus frosted-glass shapes that sample a backdrop mipmap
+// pyramid. Outputs PREMULTIPLIED alpha — pair with blend state One /
+// OneMinusSrcAlpha and a PreMultiplied surface composite mode.
 //
 // Two fragment entry points:
 //   - `fs_opaque`: no @group(1) usage. Used by the backdrop pass (which
-//     targets an offscreen rgba8unorm and must not sample the texture it
-//     is writing).
-//   - `fs_main`: includes the glass branch that samples `blurred_tex`.
-//     Used by the final surface pass.
+//     writes mip 0 of the backdrop texture and must not sample the
+//     texture it is writing).
+//   - `fs_main`: includes the glass branch that samples `backdrop_tex`
+//     via dual-filter upsample at a per-glass LOD. Used by the final
+//     surface pass.
 
 const SHAPE_KIND_RECT: u32  = 0u;
 const SHAPE_KIND_GLASS: u32 = 1u;
+const SHAPE_KIND_GLYPH: u32 = 2u;
+const SHAPE_KIND_IMAGE: u32 = 3u;
 
 struct ShapeInstance {
     color: vec4<f32>,
@@ -24,7 +26,7 @@ struct ShapeInstance {
     size: vec2<f32>,            // pixels
     shadow_offset: vec2<f32>,
     shape_kind: u32,
-    roughness: f32,
+    _pad0: f32,
     border_width: f32,
     shadow_blur: f32,
     shadow_opacity: f32,
@@ -33,7 +35,12 @@ struct ShapeInstance {
 
 struct Frame {
     screen_size: vec2<f32>,
-    _pad: vec2<f32>,
+    /// Maximum usable LOD for the backdrop mip pyramid. The glass
+    /// branch clamps `log2(blur_px)` to this so very large authored
+    /// radii don't punch through the bottom of the pyramid (a 1×1
+    /// mip is just an average of the whole frame).
+    max_backdrop_lod: f32,
+    _pad: f32,
 }
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -41,8 +48,25 @@ struct Frame {
 
 // Final-pass-only bindings. The opaque-pass pipeline layout omits group 1
 // so only fs_main references these.
-@group(1) @binding(0) var blurred_tex: texture_2d<f32>;
-@group(1) @binding(1) var blurred_samp: sampler;
+//
+// `backdrop_tex` is the opaque-pass output (rgba8unorm, linear premul)
+// with a full mip pyramid filled by `cs_downsample` (dual-filter down).
+// The glass branch picks a per-instance fractional LOD = log2(blur_px)
+// and gathers via dual-filter upsample for smooth Gaussian-like blur
+// at any radius.
+@group(1) @binding(0) var backdrop_tex: texture_2d<f32>;
+@group(1) @binding(1) var backdrop_samp: sampler;
+
+// Glyph atlas (R8Unorm). Final-pass only — opaque pass discards glyph
+// instances, so its layout omits group 2.
+@group(2) @binding(0) var glyph_tex: texture_2d<f32>;
+@group(2) @binding(1) var glyph_samp: sampler;
+
+// Image atlas (Rgba8UnormSrgb — texture sampler returns linear). Final
+// pass only; opaque discards. Authored colors round-trip through the
+// sRGB texture decode automatically, so no manual srgb_to_linear here.
+@group(3) @binding(0) var image_tex: texture_2d<f32>;
+@group(3) @binding(1) var image_samp: sampler;
 
 struct VSOut {
     @builtin(position) pos: vec4<f32>,
@@ -99,6 +123,17 @@ fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
     let cutoff = vec3<f32>(0.04045);
     let lo = c / 12.92;
     let hi = pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
+    return select(lo, hi, c > cutoff);
+}
+
+// Inverse of srgb_to_linear. Used by the glass branch so the tint
+// alpha-blend happens in perceptual (sRGB) space — author writes
+// rgba(1,1,1,0.08) expecting an 8%-perceived white tint, not an
+// 8%-linear-light tint (which would gamma-amplify to ~32% grey).
+fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
+    let cutoff = vec3<f32>(0.0031308);
+    let lo = c * 12.92;
+    let hi = 1.055 * pow(max(c, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.4)) - 0.055;
     return select(lo, hi, c > cutoff);
 }
 
@@ -167,12 +202,55 @@ fn compute_shadow(inst: ShapeInstance, px: vec2<f32>, center: vec2<f32>,
     return s;
 }
 
-// Fragment entry for the backdrop (opaque) pass. No texture binding
-// references → pipeline layout omits group 1.
+// Fragment entry for the backdrop (opaque) pass. Group 1 (the
+// blurred backdrop sampler) is omitted — glass would feedback-loop on
+// the texture being written. Glyph + image atlases (groups 2 and 3)
+// ARE bound so text and images can enter the backdrop and appear
+// blurred behind glass panels in painter's order.
 @fragment
 fn fs_opaque(in: VSOut) -> @location(0) vec4<f32> {
     let inst = instances[in.inst_idx];
+    if (inst.shape_kind == SHAPE_KIND_GLASS) {
+        // Glass samples the backdrop it would otherwise write into —
+        // skip it here so the blur input contains everything *behind*
+        // each glass panel without the glass itself contaminating it.
+        discard;
+    }
     let px = in.world_pos;
+
+    if (inst.shape_kind == SHAPE_KIND_GLYPH) {
+        let size = max(inst.size, vec2<f32>(1.0));
+        let rel = (px - inst.position) / size;
+        if (rel.x < 0.0 || rel.x > 1.0 || rel.y < 0.0 || rel.y > 1.0) {
+            discard;
+        }
+        let uv = inst.backdrop_uv_rect.xy + rel * inst.backdrop_uv_rect.zw;
+        let cov = textureSampleLevel(glyph_tex, glyph_samp, uv, 0.0).r;
+        let rgb_lin = srgb_to_linear(inst.color.rgb);
+        let a = inst.color.a * cov * inst.opacity;
+        return vec4<f32>(rgb_lin * a, a);
+    }
+
+    if (inst.shape_kind == SHAPE_KIND_IMAGE) {
+        let size = max(inst.size, vec2<f32>(1.0));
+        let rel = (px - inst.position) / size;
+        if (rel.x < 0.0 || rel.x > 1.0 || rel.y < 0.0 || rel.y > 1.0) {
+            discard;
+        }
+        let uv = inst.backdrop_uv_rect.xy + rel * inst.backdrop_uv_rect.zw;
+        let sample = textureSampleLevel(image_tex, image_samp, uv, 0.0);
+        let center = inst.position + inst.size * 0.5;
+        let p = px - center;
+        let outer_half = inst.size * 0.5;
+        let comp_dist = sd_rounded_rect(p, outer_half, inst.border_radius);
+        let aa = max(fwidth(comp_dist), 0.5);
+        let comp_alpha = smoothstep(aa, -aa, comp_dist);
+        let tint_lin = srgb_to_linear(inst.color.rgb);
+        let a = sample.a * inst.color.a * inst.opacity * comp_alpha;
+        let rgb = sample.rgb * tint_lin * a;
+        return vec4<f32>(rgb, a);
+    }
+
     let center = inst.position + inst.size * 0.5;
     let p = px - center;
     let outer_half = inst.size * 0.5;
@@ -194,6 +272,44 @@ fn fs_opaque(in: VSOut) -> @location(0) vec4<f32> {
 fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let inst = instances[in.inst_idx];
     let px = in.world_pos;
+
+    if (inst.shape_kind == SHAPE_KIND_GLYPH) {
+        // `backdrop_uv_rect` = (u0, v0, w, h) into the R8 glyph atlas.
+        let size = max(inst.size, vec2<f32>(1.0));
+        let rel = (px - inst.position) / size;
+        // Fragments outside [0,1] (from any quad oversize) drop out.
+        if (rel.x < 0.0 || rel.x > 1.0 || rel.y < 0.0 || rel.y > 1.0) {
+            discard;
+        }
+        let uv = inst.backdrop_uv_rect.xy + rel * inst.backdrop_uv_rect.zw;
+        let cov = textureSampleLevel(glyph_tex, glyph_samp, uv, 0.0).r;
+        let rgb_lin = srgb_to_linear(inst.color.rgb);
+        let a = inst.color.a * cov * inst.opacity;
+        return vec4<f32>(rgb_lin * a, a);
+    }
+
+    if (inst.shape_kind == SHAPE_KIND_IMAGE) {
+        // `backdrop_uv_rect` = (u0, v0, w, h) into the Rgba8UnormSrgb image atlas.
+        // Tint = `inst.color` (white = unmodified). Per-corner radii clip via SDF.
+        let size = max(inst.size, vec2<f32>(1.0));
+        let rel = (px - inst.position) / size;
+        if (rel.x < 0.0 || rel.x > 1.0 || rel.y < 0.0 || rel.y > 1.0) {
+            discard;
+        }
+        let uv = inst.backdrop_uv_rect.xy + rel * inst.backdrop_uv_rect.zw;
+        let sample = textureSampleLevel(image_tex, image_samp, uv, 0.0);
+        let center = inst.position + inst.size * 0.5;
+        let p = px - center;
+        let outer_half = inst.size * 0.5;
+        let comp_dist = sd_rounded_rect(p, outer_half, inst.border_radius);
+        let aa = max(fwidth(comp_dist), 0.5);
+        let comp_alpha = smoothstep(aa, -aa, comp_dist);
+        let tint_lin = srgb_to_linear(inst.color.rgb);
+        let a = sample.a * inst.color.a * inst.opacity * comp_alpha;
+        let rgb = sample.rgb * tint_lin * a;
+        return vec4<f32>(rgb, a);
+    }
+
     let center = inst.position + inst.size * 0.5;
     let p = px - center;
     let outer_half = inst.size * 0.5;
@@ -203,26 +319,62 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
 
     var body: Body;
     if (inst.shape_kind == SHAPE_KIND_GLASS) {
-        // Screen-space UV — blurred_tex is full-res and aligned to the surface.
-        let uv = px / frame.screen_size;
-        // Tiny per-pixel extra spread driven by roughness. Cheap 5-tap.
-        let spread = max(inst.roughness, 0.0) * 2.0 / frame.screen_size;
-        let bg = (
-            textureSampleLevel(blurred_tex, blurred_samp, uv, 0.0) * 2.0 +
-            textureSampleLevel(blurred_tex, blurred_samp, uv + vec2<f32>(spread.x, 0.0), 0.0) +
-            textureSampleLevel(blurred_tex, blurred_samp, uv - vec2<f32>(spread.x, 0.0), 0.0) +
-            textureSampleLevel(blurred_tex, blurred_samp, uv + vec2<f32>(0.0, spread.y), 0.0) +
-            textureSampleLevel(blurred_tex, blurred_samp, uv - vec2<f32>(0.0, spread.y), 0.0)
-        ) * (1.0 / 6.0);
-        // `bg` is already premultiplied and already linear: the opaque
-        // pass wrote sRGB-decoded colors into the rgba8unorm backdrop
-        // target, so sampling returns linear values directly.
+        // Per-glass blur + refraction parameters. `backdrop_uv_rect` is
+        // repurposed for glass: x = blur radius (px), y = refraction
+        // strength (px). Both authored in physical px (CPU scaled them
+        // from logical).
+        let blur_px = max(inst.backdrop_uv_rect.x, 0.0);
+        let refraction_px = max(inst.backdrop_uv_rect.y, 0.0);
+
+        // SDF-driven refraction. The gradient of `comp_dist` gives the
+        // outward normal of the rounded-rect surface; near the rim the
+        // backdrop is sampled along that normal as if light bent through
+        // a curved edge. Strength fades from 1 at the rim to 0 at the
+        // centre over `refraction_px` of inset distance.
+        var sample_px = px;
+        if (refraction_px > 0.0) {
+            let eps = 1.0;
+            let nx = sd_rounded_rect(p + vec2<f32>(eps, 0.0), outer_half, inst.border_radius)
+                   - sd_rounded_rect(p - vec2<f32>(eps, 0.0), outer_half, inst.border_radius);
+            let ny = sd_rounded_rect(p + vec2<f32>(0.0, eps), outer_half, inst.border_radius)
+                   - sd_rounded_rect(p - vec2<f32>(0.0, eps), outer_half, inst.border_radius);
+            let normal = normalize(vec2<f32>(nx, ny) + vec2<f32>(1.0e-6));
+            let dist_inside = max(-comp_dist, 0.0);
+            // Quadratic falloff from rim → centre.
+            let edge = clamp(1.0 - dist_inside / refraction_px, 0.0, 1.0);
+            sample_px = px + normal * refraction_px * edge * edge;
+        }
+
+        // Dual-filter upsample (Bjørge / ARM). 8 trilinear taps weighted
+        // (4 cardinals + 2× 4 diagonals) / 12. Paired with the dual-down
+        // pyramid kernel this approximates a true Gaussian over the
+        // chosen mip depth — no visible box-pixel haloing at high blur.
+        // hp scales with selected LOD so offsets cover ~one pixel of
+        // the source mip at that level.
+        let inv_screen = 1.0 / frame.screen_size;
+        let center_uv = sample_px * inv_screen;
+        let lod = clamp(log2(max(blur_px, 1.0)), 0.0, frame.max_backdrop_lod);
+        let hp = 0.5 * exp2(lod) * inv_screen;
+        let s_l  = textureSampleLevel(backdrop_tex, backdrop_samp, center_uv + vec2<f32>(-2.0 * hp.x, 0.0),         lod);
+        let s_r  = textureSampleLevel(backdrop_tex, backdrop_samp, center_uv + vec2<f32>( 2.0 * hp.x, 0.0),         lod);
+        let s_t  = textureSampleLevel(backdrop_tex, backdrop_samp, center_uv + vec2<f32>(0.0,        -2.0 * hp.y),  lod);
+        let s_b  = textureSampleLevel(backdrop_tex, backdrop_samp, center_uv + vec2<f32>(0.0,         2.0 * hp.y),  lod);
+        let s_tl = textureSampleLevel(backdrop_tex, backdrop_samp, center_uv + vec2<f32>(-hp.x, -hp.y),             lod);
+        let s_tr = textureSampleLevel(backdrop_tex, backdrop_samp, center_uv + vec2<f32>( hp.x, -hp.y),             lod);
+        let s_bl = textureSampleLevel(backdrop_tex, backdrop_samp, center_uv + vec2<f32>(-hp.x,  hp.y),             lod);
+        let s_br = textureSampleLevel(backdrop_tex, backdrop_samp, center_uv + vec2<f32>( hp.x,  hp.y),             lod);
+        var bg = (s_l + s_r + s_t + s_b + 2.0 * (s_tl + s_tr + s_bl + s_br)) * (1.0 / 12.0);
+
+        // sRGB-space tint blend (avoids gamma-amplifying small white
+        // tints into mid-grey).
         let tint_a = inst.color.a;
-        let tint_lin = srgb_to_linear(inst.color.rgb);
-        let tint_rgb_p = tint_lin * tint_a;
-        let fill_rgb_p = tint_rgb_p + bg.rgb * (1.0 - tint_a);
+        let bg_a = max(bg.a, 1.0e-4);
+        let bg_lin = bg.rgb / bg_a;
+        let bg_srgb = linear_to_srgb(bg_lin);
+        let blend_srgb = inst.color.rgb * tint_a + bg_srgb * (1.0 - tint_a);
+        let blend_lin = srgb_to_linear(blend_srgb);
         let fill_a = tint_a + bg.a * (1.0 - tint_a);
-        // Mask by SDF alpha so rounded corners clip cleanly.
+        let fill_rgb_p = blend_lin * fill_a;
         body.rgb = fill_rgb_p * comp_alpha;
         body.a = fill_a * comp_alpha;
     } else {

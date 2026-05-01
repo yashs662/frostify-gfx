@@ -254,8 +254,7 @@ pub struct TickResult {
 }
 
 /// Collection of running tweens. The tick cadence is fixed at ~16 ms
-/// (≈60 Hz) in stage 1. Once GPU timestamps + adaptive vsync land in
-/// M7/M9 this can become dynamic.
+/// (≈60 Hz). Adaptive vsync-driven cadence is a future option.
 pub struct Timeline {
     tweens: Vec<Box<dyn TweenDyn>>,
     tick_interval: Duration,

@@ -14,9 +14,9 @@
 use std::sync::mpsc::{self, Receiver, Sender};
 
 const SLOTS: usize = 2;
-/// Five logical passes: opaque, final, blur (optional), overdraw count
-/// (optional), overdraw compose (optional). Max queries per frame = 10.
-pub const MAX_PASSES: usize = 5;
+/// Four logical passes: opaque, final, overdraw count (optional),
+/// overdraw compose (optional). Max queries per frame = 8.
+pub const MAX_PASSES: usize = 4;
 pub const QUERY_COUNT: u32 = (MAX_PASSES * 2) as u32;
 
 /// Per-slot readback buffer size. Must be ≥ `MAX_PASSES * 2 * 8` bytes
@@ -26,10 +26,9 @@ const RESOLVE_BYTES: wgpu::BufferAddress = 256;
 // Pass IDs — stable handles referenced from `FrameTiming`. The runtime
 // index inside the query set is assigned dynamically per frame.
 pub const PASS_OPAQUE: usize = 0;
-pub const PASS_BLUR: usize = 1;
-pub const PASS_FINAL: usize = 2;
-pub const PASS_OD_COUNT: usize = 3;
-pub const PASS_OD_COMPOSE: usize = 4;
+pub const PASS_FINAL: usize = 1;
+pub const PASS_OD_COUNT: usize = 2;
+pub const PASS_OD_COMPOSE: usize = 3;
 
 /// Assigns query-pair indices to passes as they run within a single
 /// frame. `pair_of[pass_id] = Some(n)` means pass `pass_id` owns
@@ -71,7 +70,6 @@ impl PassAlloc {
 pub struct FrameTiming {
     pub total_ms: f32,
     pub opaque_ms: f32,
-    pub blur_ms: f32,
     pub final_ms: f32,
     pub overdraw_ms: f32,
 }
@@ -255,12 +253,11 @@ fn parse_frame_timing(raw: &[u64], alloc: &PassAlloc, period_ns: f32) -> FrameTi
     };
     let mut t = FrameTiming {
         opaque_ms: ms_for(PASS_OPAQUE),
-        blur_ms: ms_for(PASS_BLUR),
         final_ms: ms_for(PASS_FINAL),
         overdraw_ms: ms_for(PASS_OD_COUNT) + ms_for(PASS_OD_COMPOSE),
         total_ms: 0.0,
     };
-    t.total_ms = t.opaque_ms + t.blur_ms + t.final_ms + t.overdraw_ms;
+    t.total_ms = t.opaque_ms + t.final_ms + t.overdraw_ms;
     t
 }
 
@@ -270,7 +267,6 @@ pub struct FrameStats {
     pub cpu_ms: f32,
     pub gpu_ms: f32,
     pub opaque_ms: f32,
-    pub blur_ms: f32,
     pub final_ms: f32,
     pub overdraw_ms: f32,
     pub instance_count: u32,

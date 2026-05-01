@@ -13,7 +13,17 @@ pollster = "0.4"
 log = "0.4"
 env_logger = "0.11.10"
 png = "0.18.1"
+cosmic-text = "0.19.0"
+etagere = "0.3.0"
 
 [[example]]
 name = "hello_window"
 path = "examples/hello_window.rs"
+
+[[example]]
+name = "layering"
+path = "examples/layering.rs"
+
+[[example]]
+name = "glass_grid"
+path = "examples/glass_grid.rs"

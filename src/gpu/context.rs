@@ -3,11 +3,18 @@ use std::sync::Arc;
 use winit::window::Window;
 
 use super::blur::BlurResources;
-use super::instance::{FrameUniform, ShapeInstance};
+use super::glyph_atlas::GlyphAtlas;
+use super::image_atlas::{ImageAtlas, ImageHandle};
+use super::instance::{FrameUniform, ShapeInstance, SHAPE_KIND_GLYPH, SHAPE_KIND_IMAGE};
 use super::overdraw::OverdrawResources;
 use super::pipeline::ShapePipeline;
+use crate::node::{ImageRef, TextRef};
+use crate::text::TextResources;
+
+// `TextResources` is owned by `SceneCtx`, not the renderer — shape/measure
+// passes need it too, and keeping it scene-side avoids a borrow split.
 use super::timing::{
-    FrameTiming, PassAlloc, Timing, PASS_BLUR, PASS_FINAL, PASS_OD_COMPOSE, PASS_OD_COUNT,
+    FrameTiming, PassAlloc, Timing, PASS_FINAL, PASS_OD_COMPOSE, PASS_OD_COUNT,
     PASS_OPAQUE,
 };
 
@@ -23,6 +30,8 @@ pub struct GpuContext {
     pub shape: ShapePipeline,
     pub blur: BlurResources,
     pub overdraw: OverdrawResources,
+    pub glyph_atlas: GlyphAtlas,
+    pub image_atlas: ImageAtlas,
     overdraw_mode: bool,
     instance_buffer: wgpu::Buffer,
     instance_capacity: u64,
@@ -38,14 +47,18 @@ pub struct GpuContext {
     overlay_count: u32,
 
     instance_count: u32,
-    opaque_count: u32,
+    /// Count of glass-kind instances in the most recent upload. Used
+    /// to gate the backdrop+blur passes (no glass → skip entirely)
+    /// and to populate `FrameStats.glass_count`. Non-glass count is
+    /// derived as `instance_count - glass_count`.
+    glass_count: u32,
     /// Mirror of the most recent instance list uploaded to the GPU.
     /// `set_instances` diffs against it to compute partial-upload
     /// ranges; cleared (then rebuilt) on buffer grow or when the slot
     /// count changes within the existing capacity.
     prev_instances: Vec<ShapeInstance>,
-    /// Needs a re-run of the blur compute pass on the next render. Set by
-    /// `set_instances`; cleared after render.
+    /// Needs a re-render of the opaque pass into `backdrop_tex` on the
+    /// next frame. Set by `set_instances`; cleared after render.
     backdrop_dirty: bool,
 
     /// Timestamp query resources. `Some` when the adapter advertises
@@ -135,7 +148,14 @@ impl GpuContext {
             "gpu init: format={format:?} alpha={alpha_mode:?} size={width}x{height}"
         );
 
-        let shape = ShapePipeline::new(&device, format);
+        let glyph_atlas = GlyphAtlas::new(&device, 1024);
+        let image_atlas = ImageAtlas::new(&device, 1024);
+        let shape = ShapePipeline::new(
+            &device,
+            format,
+            glyph_atlas.layout(),
+            image_atlas.layout(),
+        );
         let blur = BlurResources::new(&device, width, height);
         let overdraw =
             OverdrawResources::new(&device, width, height, format, &shape.shape_bgl);
@@ -173,7 +193,8 @@ impl GpuContext {
             0,
             bytemuck::bytes_of(&FrameUniform {
                 screen_size: [width as f32, height as f32],
-                _pad: [0.0; 2],
+                max_backdrop_lod: blur.mip_count().saturating_sub(1) as f32,
+                _pad: 0.0,
             }),
         );
 
@@ -187,6 +208,8 @@ impl GpuContext {
             shape,
             blur,
             overdraw,
+            glyph_atlas,
+            image_atlas,
             overdraw_mode: false,
             instance_buffer,
             instance_capacity,
@@ -197,7 +220,7 @@ impl GpuContext {
             overlay_bg,
             overlay_count: 0,
             instance_count: 0,
-            opaque_count: 0,
+            glass_count: 0,
             prev_instances: Vec::new(),
             backdrop_dirty: true,
             timing,
@@ -210,6 +233,8 @@ impl GpuContext {
         self.surface_config.width = width.max(1);
         self.surface_config.height = height.max(1);
         self.surface.configure(&self.device, &self.surface_config);
+        self.blur
+            .resize(&self.device, self.surface_config.width, self.surface_config.height);
         self.queue.write_buffer(
             &self.shape.frame_buffer,
             0,
@@ -218,11 +243,10 @@ impl GpuContext {
                     self.surface_config.width as f32,
                     self.surface_config.height as f32,
                 ],
-                _pad: [0.0; 2],
+                max_backdrop_lod: self.blur.mip_count().saturating_sub(1) as f32,
+                _pad: 0.0,
             }),
         );
-        self.blur
-            .resize(&self.device, self.surface_config.width, self.surface_config.height);
         // Blurred view changed — rebuild the glass bind group.
         self.glass_bg = make_glass_bg(&self.device, &self.shape, &self.blur);
         self.overdraw.resize(
@@ -241,17 +265,19 @@ impl GpuContext {
         self.overdraw_mode = on;
     }
 
-    /// Upload a complete instance list. Partitioned caller-side: the first
-    /// `opaque_count` entries are opaque shapes (drawn to backdrop + final),
-    /// the remainder are glass shapes (drawn only in the final pass).
-    /// `backdrop_hint` must be `true` when the caller knows the opaque
-    /// content changed (VISUAL/TRANSFORM/TREE on an opaque node); the
-    /// flag OR's into the existing `backdrop_dirty` state and is cleared
-    /// when the blur pass runs.
+    /// Upload a complete instance list in painter's (declared) order.
+    /// Both passes draw the same range; `fs_opaque` discards glass so
+    /// it stays out of the backdrop, while every other kind enters the
+    /// blurred backdrop and shows up behind glass panels.
+    /// `glass_count` is the number of `SHAPE_KIND_GLASS` entries in
+    /// the slice — used to gate the backdrop+blur passes and to
+    /// populate frame stats. `backdrop_hint` is OR'd into the
+    /// existing `backdrop_dirty` state and cleared when the blur
+    /// pass runs.
     pub fn set_instances(
         &mut self,
         instances: &[ShapeInstance],
-        opaque_count: u32,
+        glass_count: u32,
         backdrop_hint: bool,
     ) {
         let needed = instances.len() as u64;
@@ -311,14 +337,103 @@ impl GpuContext {
         }
 
         self.instance_count = instances.len() as u32;
-        self.opaque_count = opaque_count.min(self.instance_count);
+        self.glass_count = glass_count.min(self.instance_count);
         if backdrop_hint {
             self.backdrop_dirty = true;
         }
     }
 
     pub fn glass_count(&self) -> u32 {
-        self.instance_count - self.opaque_count
+        self.glass_count
+    }
+
+    /// Shape + rasterize each [`TextRef`] into glyph-kind shape
+    /// instances. Glyphs that miss the atlas cache are uploaded here
+    /// via `queue.write_texture`. Output is meant to be appended after
+    /// the existing glass instances (so it all draws in the final pass).
+    pub fn build_glyph_instances(
+        &mut self,
+        text: &mut TextResources,
+        refs: &[TextRef],
+    ) -> Vec<ShapeInstance> {
+        if refs.is_empty() {
+            return Vec::new();
+        }
+        let atlas_size = self.glyph_atlas.size() as f32;
+        let mut out = Vec::new();
+        for r in refs {
+            if r.content.is_empty() {
+                continue;
+            }
+            let shaped = text.shape(&r.content, r.font_size, r.line_height);
+            for g in shaped {
+                let Some(entry) =
+                    self.glyph_atlas
+                        .get_or_insert(&self.queue, text, g.cache_key)
+                else {
+                    continue;
+                };
+                if entry.width == 0 || entry.height == 0 {
+                    continue;
+                }
+                let px = r.position[0] + g.x as f32 + entry.left as f32;
+                let py = r.position[1] + g.y as f32 - entry.top as f32;
+                let uv_w = entry.width as f32 / atlas_size;
+                let uv_h = entry.height as f32 / atlas_size;
+                out.push(ShapeInstance {
+                    color: r.color,
+                    border_color: [0.0; 4],
+                    shadow_color: [0.0; 4],
+                    border_radius: [0.0; 4],
+                    backdrop_uv_rect: [entry.uv[0], entry.uv[1], uv_w, uv_h],
+                    position: [px, py],
+                    size: [entry.width as f32, entry.height as f32],
+                    shadow_offset: [0.0; 2],
+                    shape_kind: SHAPE_KIND_GLYPH,
+                    _pad0: 0.0,
+                    border_width: 0.0,
+                    shadow_blur: 0.0,
+                    shadow_opacity: 0.0,
+                    opacity: r.opacity,
+                });
+            }
+        }
+        out
+    }
+
+    /// Resolve each [`ImageRef`] against the image atlas, emitting one
+    /// `SHAPE_KIND_IMAGE` instance per known handle. Stale handles
+    /// (atlas reset / never uploaded) are silently skipped — caller
+    /// already chose to render them, missing texture would be worse.
+    pub fn build_image_instances(&self, refs: &[ImageRef]) -> Vec<ShapeInstance> {
+        if refs.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(refs.len());
+        for r in refs {
+            let Some(entry) = self.image_atlas.get(r.handle) else {
+                continue;
+            };
+            let uv_w = entry.uv[2] - entry.uv[0];
+            let uv_h = entry.uv[3] - entry.uv[1];
+            out.push(ShapeInstance {
+                color: r.color,
+                border_color: [0.0; 4],
+                shadow_color: [0.0; 4],
+                border_radius: r.border_radius,
+                backdrop_uv_rect: [entry.uv[0], entry.uv[1], uv_w, uv_h],
+                position: r.position,
+                size: r.size,
+                shadow_offset: [0.0; 2],
+                shape_kind: SHAPE_KIND_IMAGE,
+                _pad0: 0.0,
+                border_width: 0.0,
+                shadow_blur: 0.0,
+                shadow_opacity: 0.0,
+                opacity: r.opacity,
+            });
+        }
+        out
     }
 
     /// Upload a list of overlay instances drawn after the main scene.
@@ -351,18 +466,34 @@ impl GpuContext {
         self.backdrop_dirty = true;
     }
 
-    /// Encode the opaque pass, blur pass (if needed), and final pass into
-    /// `encoder`. `final_view` is the render target for the surface pass.
+    /// Drop every cached glyph from the atlas. Call when the
+    /// physical glyph size changes (DPI scale flip) — old cache_keys
+    /// are tied to a specific size, new ones won't match. The next
+    /// `build_glyph_instances` call refills lazily.
+    pub fn reset_glyph_atlas(&mut self) {
+        self.glyph_atlas.reset();
+    }
+
+    /// Decode a PNG and upload it into the image atlas. Returns a
+    /// handle the scene can pass to [`crate::node::Node::image`]. Fails
+    /// (returns `None`) on malformed PNG, oversize image, or atlas
+    /// exhaustion.
+    pub fn upload_image_png(&mut self, bytes: &[u8]) -> Option<ImageHandle> {
+        self.image_atlas.upload_png(&self.queue, bytes)
+    }
+
+    /// Encode the opaque pass, downsample dispatches (if needed), and
+    /// final pass into `encoder`. `final_view` is the render target for
+    /// the surface pass.
     fn encode_frame(&mut self, encoder: &mut wgpu::CommandEncoder, final_view: &wgpu::TextureView) {
         let mut drawcalls: u32 = 0;
         let timing_qs = self.timing.as_ref().map(|t| &t.query_set);
         let mut alloc = PassAlloc::new();
-        // The opaque pass exists only to populate `backdrop_tex` for the
-        // blur pass, which feeds `blurred_tex` read by glass shapes in
-        // the final pass. If there's no glass, the backdrop is never
-        // sampled; if glass exists but neither geometry nor color of
-        // opaque content changed since the last blur, the blurred_tex
-        // from the prior submit is still valid.
+        // The opaque pass exists only to populate `backdrop_tex` mip 0
+        // (and the rest of the pyramid via downsample) for glass shapes
+        // to sample in the final pass. If there's no glass, the backdrop
+        // is never sampled; if backdrop content hasn't changed since the
+        // last submit the existing pyramid is still valid.
         let has_glass = self.glass_count() > 0;
         let run_backdrop = has_glass && self.backdrop_dirty;
         // Pre-allocate query pairs for every pass that will run this
@@ -371,13 +502,6 @@ impl GpuContext {
         let (opaque_begin, opaque_end) = match (timing_qs, run_backdrop) {
             (Some(_), true) => {
                 let (b, e) = alloc.alloc(PASS_OPAQUE);
-                (Some(b), Some(e))
-            }
-            _ => (None, None),
-        };
-        let (blur_begin, blur_end) = match (timing_qs, run_backdrop) {
-            (Some(_), true) => {
-                let (b, e) = alloc.alloc(PASS_BLUR);
                 (Some(b), Some(e))
             }
             _ => (None, None),
@@ -404,14 +528,18 @@ impl GpuContext {
             _ => (None, None),
         };
 
-        // ---- Pass A: opaque shapes → backdrop_tex ------------------------
-        // Skipped when no glass exists (backdrop_tex unused) or the
-        // prior submit's backdrop is still valid.
+        // ---- Pass A: opaque-class shapes → backdrop_tex ------------------
+        // Draws the full instance list — `fs_opaque` discards glass
+        // instances so they stay out of the blur input. Painter's
+        // order is preserved so layered text/images appear in the
+        // backdrop in the same order they appear on the surface.
+        // Skipped when no glass exists (nothing samples backdrop_tex)
+        // or when the prior submit's backdrop is still valid.
         if run_backdrop {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("frostify.backdrop pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.blur.backdrop_view,
+                    view: &self.blur.backdrop_mip0_view,
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
@@ -428,26 +556,22 @@ impl GpuContext {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            if self.opaque_count > 0 {
+            if self.instance_count > 0 {
                 rpass.set_pipeline(&self.shape.opaque_pipeline);
                 rpass.set_bind_group(0, &self.shape_bg, &[]);
-                rpass.draw(0..6, 0..self.opaque_count);
+                rpass.set_bind_group(2, self.glyph_atlas.bind_group(), &[]);
+                rpass.set_bind_group(3, self.image_atlas.bind_group(), &[]);
+                rpass.draw(0..6, 0..self.instance_count);
                 drawcalls += 1;
             }
         }
 
-        // ---- Pass B: separable Gaussian blur ----------------------------
-        // Same gate as the opaque pass — blur consumes backdrop_tex.
+        // Downsample the freshly-rendered mip 0 into the rest of the
+        // backdrop pyramid. Glass shapes sample this with fractional
+        // LOD for variable-radius blur.
         if run_backdrop {
-            // Radius is fixed stage-1; M9 will key it off per-shape roughness.
-            let radius: u32 = 16;
-            let blur_timing = match (timing_qs, blur_begin, blur_end) {
-                (Some(qs), Some(b), Some(e)) => Some((qs, b, e)),
-                _ => None,
-            };
-            self.blur.run(&self.queue, encoder, radius, blur_timing);
+            self.blur.run_downsample(encoder);
             self.backdrop_dirty = false;
-            drawcalls += 2; // two separable compute dispatches
         }
 
         // ---- Pass C: final surface ------------------------------------
@@ -476,6 +600,8 @@ impl GpuContext {
                 rpass.set_pipeline(&self.shape.final_pipeline);
                 rpass.set_bind_group(0, &self.shape_bg, &[]);
                 rpass.set_bind_group(1, &self.glass_bg, &[]);
+                rpass.set_bind_group(2, self.glyph_atlas.bind_group(), &[]);
+                rpass.set_bind_group(3, self.image_atlas.bind_group(), &[]);
                 rpass.draw(0..6, 0..self.instance_count);
                 drawcalls += 1;
             }
@@ -483,6 +609,8 @@ impl GpuContext {
                 rpass.set_pipeline(&self.shape.final_pipeline);
                 rpass.set_bind_group(0, &self.overlay_bg, &[]);
                 rpass.set_bind_group(1, &self.glass_bg, &[]);
+                rpass.set_bind_group(2, self.glyph_atlas.bind_group(), &[]);
+                rpass.set_bind_group(3, self.image_atlas.bind_group(), &[]);
                 rpass.draw(0..6, 0..self.overlay_count);
                 drawcalls += 1;
             }
@@ -614,12 +742,15 @@ impl GpuContext {
             cpu_ms: 0.0,
             gpu_ms: t.total_ms,
             opaque_ms: t.opaque_ms,
-            blur_ms: t.blur_ms,
             final_ms: t.final_ms,
             overdraw_ms: t.overdraw_ms,
             instance_count: self.instance_count,
-            opaque_count: self.opaque_count,
-            glass_count: self.glass_count(),
+            // Non-glass count = everything that enters the backdrop
+            // pass. Reported as `opaque_count` for back-compat with the
+            // FrameStats struct (renaming would ripple through sidecar
+            // sidecar consumers).
+            opaque_count: self.instance_count - self.glass_count,
+            glass_count: self.glass_count,
             drawcalls: self.last_drawcalls,
             dirty_mask: 0,
         }
@@ -639,16 +770,13 @@ impl GpuContext {
         let stride = std::mem::size_of::<ShapeInstance>() as u64;
         let (bw, bh) = self.blur.resolution();
         let blur_px = bw as u64 * bh as u64;
-        // 3 textures (backdrop + tmp + blurred), all Rgba8Unorm → 4 B/px.
-        let blur_textures = blur_px * 4 * 3;
+        // Mipmap pyramid: each level is 1/4 the previous. Geometric
+        // series sum ≈ 4/3 of base. Rgba8Unorm = 4 B/px.
+        let blur_textures = (blur_px * 4 * 4) / 3;
         let (ow, oh) = self.overdraw.resolution();
         // 1 texture, Rgba16Float → 8 B/px.
         let overdraw_textures = (ow as u64) * (oh as u64) * 8;
-        // 2× params uniform buffers, 16 B each (see BlurParams in blur.rs).
-        // Rounded up to a conservative 32 B total — the struct is small
-        // and the allocation alignment rules don't warrant exact
-        // accounting.
-        let params_buffers: u64 = 32;
+        let params_buffers: u64 = 0;
         // Timing: 1× resolve (256) + 2× readback (256 each) when active.
         let timing = if self.timing.is_some() { 256 * 3 } else { 0 };
         MemoryReport {
@@ -659,6 +787,8 @@ impl GpuContext {
             overdraw_textures,
             timing,
             params_buffers,
+            glyph_atlas: self.glyph_atlas.memory_bytes(),
+            image_atlas: self.image_atlas.memory_bytes(),
         }
     }
 
@@ -781,6 +911,8 @@ pub struct MemoryReport {
     pub overdraw_textures: u64,
     pub timing: u64,
     pub params_buffers: u64,
+    pub glyph_atlas: u64,
+    pub image_atlas: u64,
 }
 
 impl MemoryReport {
@@ -792,6 +924,8 @@ impl MemoryReport {
             + self.overdraw_textures
             + self.timing
             + self.params_buffers
+            + self.glyph_atlas
+            + self.image_atlas
     }
 }
 
@@ -827,7 +961,7 @@ fn make_glass_bg(
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: wgpu::BindingResource::TextureView(&blur.blurred_view),
+                resource: wgpu::BindingResource::TextureView(&blur.backdrop_view),
             },
             wgpu::BindGroupEntry {
                 binding: 1,

@@ -1,9 +1,8 @@
 //! Reactive value primitive.
 //!
-//! Stage-1 minimal: a shared cell + monotonic version counter. `set` skips
-//! no-op writes (value unchanged) so callers can drive signals from input
-//! events without flooding dirty. Subscriber callbacks land in M5/M6 when
-//! input + animation need them.
+//! Shared cell + monotonic version counter. `set` skips no-op writes
+//! (value unchanged) so callers can drive signals from input events
+//! without flooding dirty.
 
 use std::cell::Cell;
 use std::rc::Rc;
