@@ -36,10 +36,11 @@ pub use gpu::{
     MemoryReport, ShapeInstance,
 };
 pub use input::{InputChange, InputState};
-pub use layout::{Align, Axis, Justify, LayoutStyle, Len, Measurer, NullMeasurer};
+pub use layout::{Align, Axis, Justify, LayoutStyle, Len, Measurer, NullMeasurer, Overflow};
 pub use node::{
-    dirty, HitEntry, ImageRef, Node, NodeBuilder, NodeId, NodeTree, ShapeKind, ShapeStyle,
-    TextRef, WindowAction,
+    dirty, BarSide, HitEntry, ImageRef, Node, NodeBuilder, NodeId, NodeTree, ScrollAxis,
+    ScrollHit, ScrollState, ScrollbarHit, ScrollbarStyle, ShapeKind, ShapeStyle, TextRef,
+    WindowAction,
 };
 pub use reactive::{animated, AnimatedBind, Bind, Computed, DepTuple, Source};
 pub use scene::{

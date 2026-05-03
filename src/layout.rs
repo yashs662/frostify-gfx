@@ -71,6 +71,29 @@ pub enum Align {
     Stretch,
 }
 
+/// How a container handles flow children that exceed its content box on
+/// a given axis.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum Overflow {
+    /// Children paint past container bounds (current behavior).
+    #[default]
+    Visible,
+    /// Children are clipped to the container; scroll offset is applied.
+    /// Wheel input over the container updates the offset.
+    Scroll,
+    /// Clip but no scroll input.
+    Hidden,
+}
+
+impl Overflow {
+    pub fn clips(self) -> bool {
+        !matches!(self, Overflow::Visible)
+    }
+    pub fn scrolls(self) -> bool {
+        matches!(self, Overflow::Scroll)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct LayoutStyle {
     pub axis: Axis,
@@ -87,6 +110,9 @@ pub struct LayoutStyle {
     /// flow layout. Root nodes treat `Some` as viewport-relative and
     /// `None` as origin `(0, 0)`.
     pub abs: Option<[f32; 2]>,
+    /// Per-axis overflow behavior. Default Visible on both axes.
+    pub overflow_x: Overflow,
+    pub overflow_y: Overflow,
 }
 
 impl Default for LayoutStyle {
@@ -100,7 +126,18 @@ impl Default for LayoutStyle {
             justify: Justify::Start,
             align: Align::Start,
             abs: None,
+            overflow_x: Overflow::Visible,
+            overflow_y: Overflow::Visible,
         }
+    }
+}
+
+impl LayoutStyle {
+    pub fn clips(&self) -> bool {
+        self.overflow_x.clips() || self.overflow_y.clips()
+    }
+    pub fn scrolls(&self) -> bool {
+        self.overflow_x.scrolls() || self.overflow_y.scrolls()
     }
 }
 
@@ -310,6 +347,10 @@ fn layout_children<M: Measurer>(
         Axis::Col => (content_y, content_x),
     };
 
+    // Track bounding extent for content_size (scroll math).
+    let mut max_x: f32 = content_x;
+    let mut max_y: f32 = content_y;
+
     let mut cursor = main_start + leading;
     for (i, &c) in flow.iter().enumerate() {
         let m = child_main[i];
@@ -350,6 +391,8 @@ fn layout_children<M: Measurer>(
         if let Some(n) = tree.get_mut_raw(c) {
             n.rect = [x, y, w, h];
         }
+        max_x = max_x.max(x + w);
+        max_y = max_y.max(y + h);
         layout_children(tree, c, measurer, scale);
         cursor += m + gap + between_extra;
     }
@@ -382,7 +425,29 @@ fn layout_children<M: Measurer>(
         if let Some(n) = tree.get_mut_raw(c) {
             n.rect = [x, y, w, h];
         }
+        max_x = max_x.max(x + w);
+        max_y = max_y.max(y + h);
         layout_children(tree, c, measurer, scale);
+    }
+
+    // Persist content_size relative to parent rect (includes right/bottom
+    // padding so a scrolled-to-end view shows the trailing pad).
+    let content_extent_w = (max_x - parent_rect[0]) + pad_r;
+    let content_extent_h = (max_y - parent_rect[1]) + pad_b;
+    if let Some(p) = tree.get_mut_raw(parent) {
+        p.content_size = [content_extent_w, content_extent_h];
+        // Re-clamp scroll target if not in overscroll mode and content
+        // shrank below current target.
+        if let Some(s) = p.scroll.as_mut()
+            && !s.overscroll
+        {
+            let max_off_x = (content_extent_w - parent_rect[2]).max(0.0);
+            let max_off_y = (content_extent_h - parent_rect[3]).max(0.0);
+            s.target[0] = s.target[0].clamp(0.0, max_off_x);
+            s.target[1] = s.target[1].clamp(0.0, max_off_y);
+            s.current[0] = s.current[0].clamp(0.0, max_off_x);
+            s.current[1] = s.current[1].clamp(0.0, max_off_y);
+        }
     }
 }
 

@@ -22,11 +22,18 @@ struct ShapeInstance {
     shadow_color: vec4<f32>,
     border_radius: vec4<f32>,   // TL, TR, BL, BR (pixels)
     backdrop_uv_rect: vec4<f32>,
+    /// Scissor rect in physical px: (min_x, min_y, max_x, max_y).
+    /// Fragment is discarded if outside. Sentinel = ±1e30.
+    clip_rect: vec4<f32>,
     position: vec2<f32>,        // top-left in pixels
     size: vec2<f32>,            // pixels
     shadow_offset: vec2<f32>,
     shape_kind: u32,
-    _pad0: f32,
+    /// Glass-only frosted-texture variation. Per-fragment hash is
+    /// scaled by this and offsets the backdrop sample UV by that many
+    /// physical px at the chosen mip. 0 = mirror; 1 = subtle frost;
+    /// 3+ = pebbled glass. Ignored for non-glass kinds.
+    roughness: f32,
     border_width: f32,
     shadow_blur: f32,
     shadow_opacity: f32,
@@ -137,6 +144,16 @@ fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
     return select(lo, hi, c > cutoff);
 }
 
+// Cheap hash → 2D value in [0, 1). Used for the glass roughness
+// scatter so each fragment picks a slightly different backdrop tap
+// without paying for true blue-noise. Reference: Hugo Elias / Dave_H
+// fract-mul hash, vec2 variant.
+fn hash22(p: vec2<f32>) -> vec2<f32> {
+    var p3 = fract(vec3<f32>(p.xyx) * vec3<f32>(0.1031, 0.1030, 0.0973));
+    p3 = p3 + vec3<f32>(dot(p3, p3.yzx + vec3<f32>(33.33)));
+    return fract(vec2<f32>((p3.x + p3.y) * p3.z, (p3.x + p3.z) * p3.y));
+}
+
 fn sd_rectangle(p: vec2<f32>, xy: vec2<f32>) -> f32 {
     let d = abs(p) - max(xy, vec2<f32>(0.0));
     return length(max(d, vec2<f32>(0.0))) + min(max(d.x, d.y), 0.0);
@@ -217,6 +234,10 @@ fn fs_opaque(in: VSOut) -> @location(0) vec4<f32> {
         discard;
     }
     let px = in.world_pos;
+    if (px.x < inst.clip_rect.x || px.y < inst.clip_rect.y ||
+        px.x > inst.clip_rect.z || px.y > inst.clip_rect.w) {
+        discard;
+    }
 
     if (inst.shape_kind == SHAPE_KIND_GLYPH) {
         let size = max(inst.size, vec2<f32>(1.0));
@@ -272,6 +293,10 @@ fn fs_opaque(in: VSOut) -> @location(0) vec4<f32> {
 fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let inst = instances[in.inst_idx];
     let px = in.world_pos;
+    if (px.x < inst.clip_rect.x || px.y < inst.clip_rect.y ||
+        px.x > inst.clip_rect.z || px.y > inst.clip_rect.w) {
+        discard;
+    }
 
     if (inst.shape_kind == SHAPE_KIND_GLYPH) {
         // `backdrop_uv_rect` = (u0, v0, w, h) into the R8 glyph atlas.
@@ -352,9 +377,17 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         // hp scales with selected LOD so offsets cover ~one pixel of
         // the source mip at that level.
         let inv_screen = 1.0 / frame.screen_size;
-        let center_uv = sample_px * inv_screen;
+        var center_uv = sample_px * inv_screen;
         let lod = clamp(log2(max(blur_px, 1.0)), 0.0, frame.max_backdrop_lod);
         let hp = 0.5 * exp2(lod) * inv_screen;
+        // Per-fragment scatter in physical px → frosted-glass texture.
+        // Scale stays mip-independent (author asks for "N px of jitter"
+        // regardless of blur radius) — small N reads as fine frost,
+        // large N as pebbled glass.
+        if (inst.roughness > 0.0) {
+            let r2 = (hash22(in.pos.xy) - vec2<f32>(0.5)) * 2.0;
+            center_uv = center_uv + r2 * inst.roughness * inv_screen;
+        }
         let s_l  = textureSampleLevel(backdrop_tex, backdrop_samp, center_uv + vec2<f32>(-2.0 * hp.x, 0.0),         lod);
         let s_r  = textureSampleLevel(backdrop_tex, backdrop_samp, center_uv + vec2<f32>( 2.0 * hp.x, 0.0),         lod);
         let s_t  = textureSampleLevel(backdrop_tex, backdrop_samp, center_uv + vec2<f32>(0.0,        -2.0 * hp.y),  lod);

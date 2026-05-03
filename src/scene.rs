@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 
 use crate::gpu::ImageHandle;
-use crate::layout::{Align, Axis, Justify, Len};
+use crate::layout::{Align, Axis, Justify, Len, Overflow};
 use crate::node::{Node, NodeId, NodeInteract, NodeTree, WindowAction};
 use crate::reactive::Bind;
 use crate::signal::Signal;
@@ -349,6 +349,91 @@ impl<'a> NodeBuilderRef<'a> {
         self
     }
 
+    // --- overflow / scroll ---
+
+    /// Set per-axis overflow. Goes through [`NodeTree::set_layout_overflow`]
+    /// so `ScrollState` allocation and the `scrollable_ids` index stay
+    /// in sync.
+    pub fn overflow(&mut self, ox: Overflow, oy: Overflow) -> &mut Self {
+        self.ctx.tree.set_layout_overflow(self.id, ox, oy);
+        self
+    }
+
+    pub fn overflow_x(&mut self, o: Overflow) -> &mut Self {
+        let oy = self
+            .ctx
+            .tree
+            .get(self.id)
+            .map(|n| n.layout.overflow_y)
+            .unwrap_or(Overflow::Visible);
+        self.ctx.tree.set_layout_overflow(self.id, o, oy);
+        self
+    }
+
+    pub fn overflow_y(&mut self, o: Overflow) -> &mut Self {
+        let ox = self
+            .ctx
+            .tree
+            .get(self.id)
+            .map(|n| n.layout.overflow_x)
+            .unwrap_or(Overflow::Visible);
+        self.ctx.tree.set_layout_overflow(self.id, ox, o);
+        self
+    }
+
+    /// Both axes scroll.
+    pub fn scroll(&mut self) -> &mut Self {
+        self.overflow(Overflow::Scroll, Overflow::Scroll)
+    }
+
+    pub fn scroll_x(&mut self) -> &mut Self {
+        self.overflow_x(Overflow::Scroll)
+    }
+
+    pub fn scroll_y(&mut self) -> &mut Self {
+        self.overflow_y(Overflow::Scroll)
+    }
+
+    /// Both axes Hidden — clip without accepting wheel input.
+    pub fn clip(&mut self) -> &mut Self {
+        self.overflow(Overflow::Hidden, Overflow::Hidden)
+    }
+
+    /// Spring stiffness controlling scroll smoothness. Higher = snappier.
+    /// No-op on non-scrollable nodes (overflow not set to Scroll on
+    /// either axis). Default 12 ≈ 100 ms time-to-converge.
+    pub fn scroll_smoothness(&mut self, k: f32) -> &mut Self {
+        self.ctx.tree.set_scroll_stiffness(self.id, k);
+        self
+    }
+
+    /// Allow the scroll target to push past the content edge. The
+    /// spring still pulls it back. Default false.
+    pub fn overscroll(&mut self, on: bool) -> &mut Self {
+        self.ctx.tree.set_scroll_overscroll(self.id, on);
+        self
+    }
+
+    /// Replace this node's scrollbar style outright. Allocates a
+    /// `ScrollState` if the node isn't already scrollable so style
+    /// can be authored before `.scroll*()`.
+    pub fn scrollbar_style(&mut self, style: crate::node::ScrollbarStyle) -> &mut Self {
+        self.ctx.tree.set_scrollbar_style(self.id, style);
+        self
+    }
+
+    /// Mutate the scrollbar style with a closure: e.g.
+    /// `.scrollbar(|s| s.thickness(8.0).thumb_color([1,1,1,0.7]))`.
+    pub fn scrollbar<F: FnOnce(crate::node::ScrollbarStyle) -> crate::node::ScrollbarStyle>(
+        &mut self,
+        f: F,
+    ) -> &mut Self {
+        self.ctx
+            .tree
+            .with_scrollbar_style(self.id, |s| *s = f(*s));
+        self
+    }
+
     // --- style ---
 
     pub fn color(&mut self, color: impl Into<Bind<[f32; 4]>>) -> &mut Self {
@@ -448,6 +533,16 @@ impl<'a> NodeBuilderRef<'a> {
     pub fn refraction(&mut self, px: f32) -> &mut Self {
         if let Some(n) = self.ctx.tree.get_mut_raw(self.id) {
             n.style.refraction = px;
+        }
+        self
+    }
+
+    /// Per-glass frosted-texture variation (logical px). Per-fragment
+    /// hash scatters the backdrop sample by this many pixels at the
+    /// chosen mip. 0 = mirror; ~1 = subtle frost; ~3 = pebbled.
+    pub fn roughness(&mut self, px: f32) -> &mut Self {
+        if let Some(n) = self.ctx.tree.get_mut_raw(self.id) {
+            n.style.roughness = px;
         }
         self
     }

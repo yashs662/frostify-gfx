@@ -13,11 +13,12 @@ struct ShapeInstance {
     shadow_color: vec4<f32>,
     border_radius: vec4<f32>,
     backdrop_uv_rect: vec4<f32>,
+    clip_rect: vec4<f32>,
     position: vec2<f32>,
     size: vec2<f32>,
     shadow_offset: vec2<f32>,
     shape_kind: u32,
-    _pad0: f32,
+    roughness: f32,
     border_width: f32,
     shadow_blur: f32,
     shadow_opacity: f32,
@@ -96,6 +97,11 @@ fn sd_rounded_rect(p: vec2<f32>, xy: vec2<f32>, r: vec4<f32>) -> f32 {
 @fragment
 fn fs_count(in: VSOut) -> @location(0) vec4<f32> {
     let inst = instances[in.inst_idx];
+    let px = in.world_pos;
+    if (px.x < inst.clip_rect.x || px.y < inst.clip_rect.y ||
+        px.x > inst.clip_rect.z || px.y > inst.clip_rect.w) {
+        discard;
+    }
     let center = inst.position + inst.size * 0.5;
     let p = in.world_pos - center;
     let outer_half = inst.size * 0.5;

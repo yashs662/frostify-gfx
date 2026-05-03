@@ -43,7 +43,7 @@ use crate::anim::Timeline;
 use crate::debug;
 use crate::gpu::{FrameStats, GpuContext, ImageHandle, ShapeInstance};
 use crate::input::InputState;
-use crate::node::{FlatEvent, HitEntry, WindowAction};
+use crate::node::{FlatEvent, HitEntry, ScrollAxis, ScrollHit, ScrollbarHit, WindowAction};
 use crate::scene::{ColorBindSlot, PositionBindSlot, Scene, SceneCtx, SizeBindSlot};
 
 /// Pixel band on each window edge that triggers a system resize-drag
@@ -88,6 +88,26 @@ enum StagedImage {
     Rgba { w: u32, h: u32, bytes: Vec<u8> },
 }
 
+/// Active thumb-drag bookkeeping. While the user holds the mouse on a
+/// thumb the pointer is the authoritative position — we map cursor
+/// motion 1:1 onto scroll offset and write through `set_scroll_immediate`
+/// so the spring stays at rest.
+#[derive(Copy, Clone, Debug)]
+struct BarDrag {
+    node_id: crate::node::NodeId,
+    axis: ScrollAxis,
+    /// Cursor position when the press landed (physical px).
+    pointer_origin: f32,
+    /// Scroll offset (`current`) at the press instant.
+    scroll_origin: f32,
+    /// `track_len - thumb_len` — pixel range the thumb travels over.
+    /// Drag delta on the cursor maps to scroll delta as
+    /// `cursor_dy / track_travel * max_offset`.
+    track_travel: f32,
+    /// Maximum scroll offset on the dragged axis (`content - rect`).
+    max_offset: f32,
+}
+
 /// Optional headless script. Called once from `resumed` after the
 /// window is ready and the first frame has been captured. Use it to
 /// drive synthetic input, mutate the tree, advance the timeline by
@@ -106,7 +126,26 @@ pub struct App {
     ctx: SceneCtx,
     instances: Vec<ShapeInstance>,
     glass_count: u32,
+    /// Flatten output buffers reused across frames. Each `flush_tree`
+    /// `clear()`s and re-fills them so the heap allocations made by
+    /// the first flatten amortize over every subsequent one.
+    flat_events: Vec<FlatEvent>,
     hits: Vec<HitEntry>,
+    scroll_hits: Vec<ScrollHit>,
+    scroll_bars: Vec<ScrollbarHit>,
+    /// Per-axis active drag bookkeeping. While `Some`, pointer-move
+    /// updates the captured axis's scroll position 1:1.
+    bar_drag: Option<BarDrag>,
+    /// Cursor position pending application during a thumb drag.
+    /// CursorMoved events fire at the OS rate (often 500+ Hz on
+    /// Windows raw mouse), and applying every one re-flattens + re-
+    /// uploads the instance buffer per pixel of motion. We buffer the
+    /// latest pointer here and let `about_to_wait` apply it at frame
+    /// rate via `set_scroll_immediate`.
+    pending_drag_cursor: Option<[f32; 2]>,
+    /// Latched modifier state from `WindowEvent::ModifiersChanged`.
+    /// Consulted by wheel routing for shift-axis swap.
+    modifiers: winit::event::Modifiers,
     input: InputState,
     timeline: Timeline,
     on_key: Option<KeyFn>,
@@ -162,6 +201,17 @@ pub struct App {
     /// (window stays under the hand). We restore this position in
     /// the next DPI Resized to match that behavior.
     pre_dpi_outer: Option<winit::dpi::PhysicalPosition<i32>>,
+    /// Wall-clock instant of the most recent `about_to_wait` scroll
+    /// tick. `None` while the loop is parked on `Wait`. Drives the
+    /// scroll-spring `dt`. Reset to `None` whenever both timeline +
+    /// scrolls go idle, so the first tick after wake-up doesn't see a
+    /// stale dt spanning the idle gap.
+    last_scroll_tick: Option<Instant>,
+    /// Last wall-clock instant the HUD overlay was rebuilt. Throttles
+    /// `refresh_hud_overlay` to ~10 Hz so a fast-rendering scene
+    /// doesn't re-shape 6 stat lines every frame just to display
+    /// sub-ms jitter.
+    last_hud_refresh: Option<Instant>,
     /// Images staged for upload at GPU init. Index in this vec equals
     /// the [`ImageHandle`] returned to the caller — the image atlas
     /// allocates handles sequentially from 0, so the two stay in
@@ -179,7 +229,13 @@ impl App {
             ctx: SceneCtx::new(),
             instances: Vec::new(),
             glass_count: 0,
+            flat_events: Vec::new(),
             hits: Vec::new(),
+            scroll_hits: Vec::new(),
+            scroll_bars: Vec::new(),
+            bar_drag: None,
+            pending_drag_cursor: None,
+            modifiers: winit::event::Modifiers::default(),
             input: InputState::new(),
             timeline: Timeline::new(),
             on_key: None,
@@ -195,6 +251,8 @@ impl App {
             logical_size: [width, height],
             last_dpi_change: None,
             pre_dpi_outer: None,
+            last_scroll_tick: None,
+            last_hud_refresh: None,
             staged_images: Vec::new(),
             window: None,
             gpu: None,
@@ -340,13 +398,18 @@ impl App {
                 self.scale_factor,
             );
         }
-        let (events, hits) = self.ctx.tree.flatten();
-        self.hits = hits;
+        self.ctx.tree.flatten_into_buffers(
+            self.scale_factor,
+            &mut self.flat_events,
+            &mut self.hits,
+            &mut self.scroll_hits,
+            &mut self.scroll_bars,
+        );
         let backdrop_hint = mask & crate::node::dirty::BACKDROP != 0;
         if let Some(gpu) = self.gpu.as_mut() {
             self.instances.clear();
             self.glass_count = expand_events_into(
-                &events,
+                &self.flat_events,
                 &mut self.instances,
                 gpu,
                 &mut self.ctx.text,
@@ -393,8 +456,19 @@ impl App {
 
     /// Build a numeric-label HUD from the most recent frame stats and
     /// upload it as overlay instances. Cleared when `hud_enabled` flips
-    /// off.
+    /// off. Throttled to ~10 Hz: cpu/gpu_ms jitter would otherwise
+    /// invalidate any equality check and re-shape 6 lines per render
+    /// frame for sub-ms wiggle a human can't read anyway.
     fn refresh_hud_overlay(&mut self) {
+        let now = Instant::now();
+        let due = self
+            .last_hud_refresh
+            .map(|t| now.duration_since(t) >= Duration::from_millis(100))
+            .unwrap_or(true);
+        if !due {
+            return;
+        }
+        self.last_hud_refresh = Some(now);
         let stats = self.current_stats();
         let scale = self.scale_factor;
         if let Some(gpu) = self.gpu.as_mut() {
@@ -407,6 +481,7 @@ impl App {
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.set_overlay_instances(&[]);
         }
+        self.last_hud_refresh = None;
     }
 
     /// Forward the GPU memory-allocation snapshot from the renderer.
@@ -627,6 +702,7 @@ fn expand_events_into(
                     // Both authored in logical px, scaled to physical.
                     s.backdrop_uv_rect[0] *= scale;
                     s.backdrop_uv_rect[1] *= scale;
+                    s.roughness *= scale;
                 }
                 out.push(s);
             }
@@ -711,6 +787,7 @@ fn build_hud_instances(
             // shaper — match that calling convention.
             font_size,
             line_height: line_h,
+            clip_rect: crate::gpu::NO_CLIP,
         })
         .collect();
     out.extend(gpu.build_glyph_instances(text, &refs));
@@ -801,7 +878,10 @@ pub struct HeadlessHelper<'a> {
     pub timeline: &'a mut Timeline,
     pub instances: &'a mut Vec<ShapeInstance>,
     pub glass_count: &'a mut u32,
+    pub flat_events: &'a mut Vec<FlatEvent>,
     pub hits: &'a mut Vec<HitEntry>,
+    pub scroll_hits: &'a mut Vec<crate::node::ScrollHit>,
+    pub scroll_bars: &'a mut Vec<ScrollbarHit>,
     pub capture_dir: &'a Path,
     /// Stats snapshot taken at end of `render()`. `capture()` reads
     /// from here so the sidecar describes the live render frame, not
@@ -834,11 +914,16 @@ impl<'a> HeadlessHelper<'a> {
                 self.scale_factor,
             );
         }
-        let (events, hits) = self.ctx.tree.flatten();
-        *self.hits = hits;
+        self.ctx.tree.flatten_into_buffers(
+            self.scale_factor,
+            self.flat_events,
+            self.hits,
+            self.scroll_hits,
+            self.scroll_bars,
+        );
         self.instances.clear();
         *self.glass_count = expand_events_into(
-            &events,
+            self.flat_events,
             self.instances,
             self.gpu,
             &mut self.ctx.text,
@@ -1061,7 +1146,10 @@ impl ApplicationHandler for App {
                 timeline: &mut self.timeline,
                 instances: &mut self.instances,
                 glass_count: &mut self.glass_count,
+                flat_events: &mut self.flat_events,
                 hits: &mut self.hits,
+                scroll_hits: &mut self.scroll_hits,
+                scroll_bars: &mut self.scroll_bars,
                 capture_dir: &self.config.capture_dir,
                 last_render_stats: &mut self.last_render_stats,
                 scale_factor: self.scale_factor,
@@ -1160,6 +1248,10 @@ impl ApplicationHandler for App {
                     if let Some(g) = self.gpu.as_mut() {
                         g.reset_glyph_atlas();
                     }
+                    // Shape cache keys include physical font_size; old
+                    // entries would never match again under the new
+                    // scale so drop them to keep the table small.
+                    self.ctx.text.clear_shape_cache();
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -1173,15 +1265,37 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 let x = position.x as f32;
                 let y = position.y as f32;
+                self.input.cursor = Some([x, y]);
+                if self.bar_drag.is_some() {
+                    // Coalesce: don't apply per OS event. Stash the
+                    // latest cursor and let `about_to_wait` push it
+                    // through at frame rate. Skips hover refresh + the
+                    // hit-test path during drag (cursor is captured by
+                    // the thumb anyway). Ensure the loop wakes up so
+                    // the pending cursor gets applied promptly.
+                    self.pending_drag_cursor = Some([x, y]);
+                    self.request_redraw();
+                    return;
+                }
+                let bar_changed = crate::input::update_scrollbar_hover(
+                    Some([x, y]),
+                    &self.scroll_bars,
+                    &mut self.ctx.tree,
+                );
                 let change =
                     self.input
                         .on_cursor_moved(x, y, &self.hits, &self.ctx.tree);
                 self.refresh_cursor(x, y);
-                if change.any() {
+                if change.any() || bar_changed {
                     self.react();
                 }
             }
             WindowEvent::CursorLeft { .. } => {
+                let bar_changed = crate::input::update_scrollbar_hover(
+                    None,
+                    &self.scroll_bars,
+                    &mut self.ctx.tree,
+                );
                 let change = self.input.on_cursor_left(&self.hits, &self.ctx.tree);
                 if self.last_cursor_icon != CursorIcon::Default {
                     self.last_cursor_icon = CursorIcon::Default;
@@ -1189,7 +1303,39 @@ impl ApplicationHandler for App {
                         w.set_cursor(CursorIcon::Default);
                     }
                 }
-                if change.any() {
+                if change.any() || bar_changed {
+                    self.react();
+                }
+            }
+            WindowEvent::ModifiersChanged(mods) => {
+                self.modifiers = mods;
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let Some([cx, cy]) = self.input.cursor else {
+                    return;
+                };
+                // Convert winit's delta to pixel scroll-target delta.
+                // Wheel forward (positive y) = scroll content *up* =
+                // target.y decreases, hence the sign flip on both axes.
+                // LineDelta uses 50 logical-px-per-line (typical desktop
+                // line height) scaled by the display factor.
+                let px = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(lx, ly) => {
+                        let line = 50.0 * self.scale_factor;
+                        [-lx * line, -ly * line]
+                    }
+                    winit::event::MouseScrollDelta::PixelDelta(p) => {
+                        [-p.x as f32, -p.y as f32]
+                    }
+                };
+                let shift = self.modifiers.state().shift_key();
+                if crate::input::on_wheel(
+                    [cx, cy],
+                    px,
+                    &self.scroll_hits,
+                    &mut self.ctx.tree,
+                    shift,
+                ) {
                     self.react();
                 }
             }
@@ -1206,6 +1352,40 @@ impl ApplicationHandler for App {
                             }
                             return;
                         }
+                    // Scrollbar layer wins over normal hit-test if the
+                    // cursor is on a visible bar.
+                    if let Some([cx, cy]) = self.input.cursor {
+                        match crate::input::press_scrollbar(
+                            [cx, cy],
+                            &self.scroll_bars,
+                            &mut self.ctx.tree,
+                        ) {
+                            crate::input::ScrollbarPress::StartDrag {
+                                node_id,
+                                axis,
+                                pointer_origin,
+                                scroll_origin,
+                                track_travel,
+                                max_offset,
+                            } => {
+                                self.bar_drag = Some(BarDrag {
+                                    node_id,
+                                    axis,
+                                    pointer_origin,
+                                    scroll_origin,
+                                    track_travel,
+                                    max_offset,
+                                });
+                                self.react();
+                                return;
+                            }
+                            crate::input::ScrollbarPress::JumpedToPosition => {
+                                self.react();
+                                return;
+                            }
+                            crate::input::ScrollbarPress::Miss => {}
+                        }
+                    }
                     if let Some(action) = self.hovered_window_action()
                         && self.dispatch_window_action(action, event_loop) {
                             return;
@@ -1216,6 +1396,23 @@ impl ApplicationHandler for App {
                         self.input.on_left_pressed(&self.hits, &self.ctx.tree)
                     }
                     ElementState::Released => {
+                        // End any in-flight thumb drag. Apply the last
+                        // pending cursor so the final pixel lands.
+                        if let Some(d) = self.bar_drag.take() {
+                            if let Some(c) = self.pending_drag_cursor.take() {
+                                let _ = crate::input::drag_to(
+                                    c,
+                                    d.node_id,
+                                    d.axis,
+                                    d.pointer_origin,
+                                    d.scroll_origin,
+                                    d.track_travel,
+                                    d.max_offset,
+                                    &mut self.ctx.tree,
+                                );
+                            }
+                            crate::input::end_drag(d.node_id, d.axis, &mut self.ctx.tree);
+                        }
                         self.input.on_left_released(&self.hits, &self.ctx.tree)
                     }
                 };
@@ -1286,22 +1483,64 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Animation pump. If idle, park on `Wait` so the loop is 0% CPU.
-        // If active, advance every tween, push interpolated values
-        // through the bind registry, flush, and request redraw with
-        // the next frame deadline.
-        if !self.timeline.active() {
+        // Animation + scroll pump. If both are idle, park on `Wait` so
+        // the loop is 0% CPU. Otherwise: advance both, push interpolated
+        // values through the bind registry, flush, redraw, and schedule
+        // the next deadline.
+        let now = Instant::now();
+        // Drain any coalesced thumb-drag cursor: a single
+        // set_scroll_immediate per frame, regardless of how many
+        // CursorMoved events fired since the last tick.
+        let drag_moved = if let (Some(d), Some(c)) = (self.bar_drag, self.pending_drag_cursor) {
+            self.pending_drag_cursor = None;
+            crate::input::drag_to(
+                c,
+                d.node_id,
+                d.axis,
+                d.pointer_origin,
+                d.scroll_origin,
+                d.track_travel,
+                d.max_offset,
+                &mut self.ctx.tree,
+            )
+        } else {
+            false
+        };
+        let timeline_active = self.timeline.active();
+        let scroll_active = self.ctx.tree.has_active_scrolls();
+        if !timeline_active && !scroll_active && !drag_moved {
+            self.last_scroll_tick = None;
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
         }
-        let res = self.timeline.tick(Instant::now());
-        if res.updated {
-            self.pump_animated_displays();
+        let dt = match self.last_scroll_tick {
+            Some(prev) => (now - prev).as_secs_f32().min(0.05),
+            None => 0.0,
+        };
+        self.last_scroll_tick = Some(now);
+        let scroll_moved = self.ctx.tree.tick_scrolls(dt);
+        let res = self.timeline.tick(now);
+        if res.updated || scroll_moved || drag_moved {
+            if res.updated {
+                self.pump_animated_displays();
+            }
             if self.flush_tree() {
                 self.request_redraw();
             }
         }
-        match res.next_deadline {
+        let next_scroll_deadline = if self.ctx.tree.has_active_scrolls() || self.bar_drag.is_some()
+        {
+            Some(now + std::time::Duration::from_millis(16))
+        } else {
+            None
+        };
+        let combined = match (res.next_deadline, next_scroll_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        match combined {
             Some(deadline) => event_loop.set_control_flow(ControlFlow::WaitUntil(deadline)),
             None => event_loop.set_control_flow(ControlFlow::Wait),
         }

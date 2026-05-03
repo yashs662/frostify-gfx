@@ -13,9 +13,14 @@ pub const SHAPE_KIND_GLYPH: u32 = 2;
 /// multiplied by `color` (used as tint; `[1,1,1,1]` for unmodified).
 pub const SHAPE_KIND_IMAGE: u32 = 3;
 
+/// Sentinel clip rect = no clipping. Min way below screen, max way
+/// above. The shader compares `px` against these bounds and discards
+/// outside; with the sentinel, nothing is ever discarded.
+pub const NO_CLIP: [f32; 4] = [-1.0e30, -1.0e30, 1.0e30, 1.0e30];
+
 /// GPU shape instance. Layout must match `ShapeInstance` in `shape.wgsl`.
-/// std430-compatible. **128 bytes, 16-aligned.** WGSL `array<ShapeInstance>`
-/// stride = roundUp(16, last_offset + last_size) = 128. The Rust struct
+/// std430-compatible. **144 bytes, 16-aligned.** WGSL `array<ShapeInstance>`
+/// stride = roundUp(16, last_offset + last_size) = 144. The Rust struct
 /// size must match exactly — do not add trailing pad fields (the
 /// alignment-rounded stride bites silently otherwise).
 #[repr(C)]
@@ -31,20 +36,28 @@ pub struct ShapeInstance {
     ///   - Image: atlas `(u0, v0, w, h)` into the Rgba8 image atlas
     ///   - Rect: ignored
     pub backdrop_uv_rect: [f32; 4],
+    /// Scissor rect in physical px: `(min_x, min_y, max_x, max_y)`. The
+    /// fragment shader discards any fragment outside these bounds.
+    /// Default `NO_CLIP` = no clipping. Set by the flatten pass when the
+    /// instance lives under a Scroll/Hidden overflow container.
+    pub clip_rect: [f32; 4],
     pub position: [f32; 2], // top-left, pixels
     pub size: [f32; 2],     // pixels
     pub shadow_offset: [f32; 2],
     pub shape_kind: u32,
-    /// Reserved for future per-instance use; keeps the struct at 128 B
-    /// so `array<ShapeInstance>` stride matches WGSL.
-    pub _pad0: f32,
+    /// Glass-only. Per-fragment LOD jitter for frosted-texture variation:
+    /// sample UV is scattered by `hash(frag_coord) * roughness` pixels at
+    /// the chosen mip. 0 = mirror-smooth glass; ~1 = noticeable
+    /// frosted-pane texture; ~3 = pebbled. Authored in physical px;
+    /// scales with display factor like `border_width`.
+    pub roughness: f32,
     pub border_width: f32,
     pub shadow_blur: f32,
     pub shadow_opacity: f32,
     pub opacity: f32,
 }
 
-const _: () = assert!(std::mem::size_of::<ShapeInstance>() == 128);
+const _: () = assert!(std::mem::size_of::<ShapeInstance>() == 144);
 
 impl Default for ShapeInstance {
     fn default() -> Self {
@@ -54,11 +67,12 @@ impl Default for ShapeInstance {
             shadow_color: [0.0, 0.0, 0.0, 1.0],
             border_radius: [0.0; 4],
             backdrop_uv_rect: [0.0; 4],
+            clip_rect: NO_CLIP,
             position: [0.0; 2],
             size: [0.0; 2],
             shadow_offset: [0.0; 2],
             shape_kind: SHAPE_KIND_RECT,
-            _pad0: 0.0,
+            roughness: 0.0,
             border_width: 0.0,
             shadow_blur: 0.0,
             shadow_opacity: 0.0,

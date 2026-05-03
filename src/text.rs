@@ -10,6 +10,9 @@
 //! Stage 1 uses system fonts (SansSerif family, sans bundled assets)
 //! and rejects color-emoji glyphs so the atlas can stay R8Unorm.
 
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+
 use cosmic_text::{
     Attrs, Buffer, CacheKey, Family, FontSystem, Metrics, Shaping, SwashCache, SwashContent,
 };
@@ -18,6 +21,18 @@ use cosmic_text::{
 pub struct TextResources {
     font_system: FontSystem,
     swash_cache: SwashCache,
+    /// Memoized shape outputs keyed by `(content, size, line_height)`
+    /// hash. cosmic-text's `Buffer::new` + `set_text` + `shape_until_scroll`
+    /// allocates + does real work on every call; for static UI labels
+    /// (HUD stats, list rows, button captions) the same triple repeats
+    /// every flatten — caching saves 50–100µs per flatten on a Spotify-
+    /// scale scene. Hash collisions are theoretically possible (one in
+    /// 2^64) but practically irrelevant for UI text volumes.
+    shape_cache: HashMap<u64, Vec<ShapedGlyph>>,
+    /// Same shape, but for [`Self::measure`] (intrinsic-size queries
+    /// during the layout pass). The layout pass calls `measure_text`
+    /// multiple times per Auto-sized text node during flex resolution.
+    measure_cache: HashMap<u64, TextMetrics>,
 }
 
 /// One shaped glyph: an atlas key and its physical-pixel pen position.
@@ -56,46 +71,46 @@ impl TextResources {
         Self {
             font_system: FontSystem::new(),
             swash_cache: SwashCache::new(),
+            shape_cache: HashMap::new(),
+            measure_cache: HashMap::new(),
         }
+    }
+
+    /// Drop the shape + measure caches. Call after font system mutation
+    /// (font swap, axis change) or whenever cached shapes might no
+    /// longer match what the current `FontSystem` would produce. The
+    /// glyph atlas reset path doesn't need to call this — atlas cache
+    /// keys are physical-px-tied and shape cache keys are too, so a
+    /// DPI change naturally bypasses old shape entries via key mismatch.
+    pub fn clear_shape_cache(&mut self) {
+        self.shape_cache.clear();
+        self.measure_cache.clear();
     }
 
     /// Shape `text` at `size_px` line-height `line_height_px`. Returns
     /// physical glyph positions and cache keys (for atlas lookup).
+    /// Memoized — repeat calls with the same triple return a cloned
+    /// cached `Vec` instead of re-allocating a `Buffer` and re-shaping.
     pub fn shape(&mut self, text: &str, size_px: f32, line_height_px: f32) -> Vec<ShapedGlyph> {
-        let mut buf = Buffer::new(&mut self.font_system, Metrics::new(size_px, line_height_px));
-        let attrs = Attrs::new().family(Family::SansSerif);
-        buf.set_text(text, &attrs, Shaping::Advanced, None);
-        buf.shape_until_scroll(&mut self.font_system, false);
-        let mut out = Vec::new();
-        for run in buf.layout_runs() {
-            for g in run.glyphs.iter() {
-                let phys = g.physical((0.0, run.line_y), 1.0);
-                out.push(ShapedGlyph {
-                    cache_key: phys.cache_key,
-                    x: phys.x,
-                    y: phys.y,
-                });
-            }
+        let key = shape_key(text, size_px, line_height_px);
+        if let Some(cached) = self.shape_cache.get(&key) {
+            return cached.clone();
         }
+        let out = shape_uncached(&mut self.font_system, text, size_px, line_height_px);
+        self.shape_cache.insert(key, out.clone());
         out
     }
 
-    /// Shape + measure bounding box in one call.
+    /// Shape + measure bounding box in one call. Memoized like
+    /// [`Self::shape`].
     pub fn measure(&mut self, text: &str, size_px: f32, line_height_px: f32) -> TextMetrics {
-        let mut buf = Buffer::new(&mut self.font_system, Metrics::new(size_px, line_height_px));
-        let attrs = Attrs::new().family(Family::SansSerif);
-        buf.set_text(text, &attrs, Shaping::Advanced, None);
-        buf.shape_until_scroll(&mut self.font_system, false);
-        let mut w: f32 = 0.0;
-        let mut lines: u32 = 0;
-        for run in buf.layout_runs() {
-            w = w.max(run.line_w);
-            lines += 1;
+        let key = shape_key(text, size_px, line_height_px);
+        if let Some(&cached) = self.measure_cache.get(&key) {
+            return cached;
         }
-        TextMetrics {
-            width: w,
-            height: lines as f32 * line_height_px,
-        }
+        let m = measure_uncached(&mut self.font_system, text, size_px, line_height_px);
+        self.measure_cache.insert(key, m);
+        m
     }
 
     /// Rasterize one glyph. Returns `None` for color-emoji glyphs
@@ -128,6 +143,60 @@ impl crate::layout::Measurer for TextResources {
     fn measure_text(&mut self, content: &str, font_size: f32, line_height: f32) -> [f32; 2] {
         let m = self.measure(content, font_size, line_height);
         [m.width, m.height]
+    }
+}
+
+fn shape_key(content: &str, size_px: f32, line_height_px: f32) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut h);
+    h.write_u32(size_px.to_bits());
+    h.write_u32(line_height_px.to_bits());
+    h.finish()
+}
+
+fn shape_uncached(
+    fs: &mut FontSystem,
+    text: &str,
+    size_px: f32,
+    line_height_px: f32,
+) -> Vec<ShapedGlyph> {
+    let mut buf = Buffer::new(fs, Metrics::new(size_px, line_height_px));
+    let attrs = Attrs::new().family(Family::SansSerif);
+    buf.set_text(text, &attrs, Shaping::Advanced, None);
+    buf.shape_until_scroll(fs, false);
+    let mut out = Vec::new();
+    for run in buf.layout_runs() {
+        for g in run.glyphs.iter() {
+            let phys = g.physical((0.0, run.line_y), 1.0);
+            out.push(ShapedGlyph {
+                cache_key: phys.cache_key,
+                x: phys.x,
+                y: phys.y,
+            });
+        }
+    }
+    out
+}
+
+fn measure_uncached(
+    fs: &mut FontSystem,
+    text: &str,
+    size_px: f32,
+    line_height_px: f32,
+) -> TextMetrics {
+    let mut buf = Buffer::new(fs, Metrics::new(size_px, line_height_px));
+    let attrs = Attrs::new().family(Family::SansSerif);
+    buf.set_text(text, &attrs, Shaping::Advanced, None);
+    buf.shape_until_scroll(fs, false);
+    let mut w: f32 = 0.0;
+    let mut lines: u32 = 0;
+    for run in buf.layout_runs() {
+        w = w.max(run.line_w);
+        lines += 1;
+    }
+    TextMetrics {
+        width: w,
+        height: lines as f32 * line_height_px,
     }
 }
 
@@ -171,5 +240,36 @@ mod tests {
         let m = t.measure("hello", 16.0, 20.0);
         assert!(m.width > 0.0);
         assert!(m.height >= 20.0);
+    }
+
+    #[test]
+    fn shape_cache_hits_on_repeat() {
+        let mut t = TextResources::new();
+        let _ = t.shape("repeat", 16.0, 20.0);
+        assert_eq!(t.shape_cache.len(), 1);
+        let _ = t.shape("repeat", 16.0, 20.0);
+        assert_eq!(t.shape_cache.len(), 1, "second call should hit cache");
+        // Different size → fresh entry.
+        let _ = t.shape("repeat", 18.0, 22.0);
+        assert_eq!(t.shape_cache.len(), 2);
+    }
+
+    #[test]
+    fn measure_cache_hits_on_repeat() {
+        let mut t = TextResources::new();
+        let m1 = t.measure("hello", 16.0, 20.0);
+        let m2 = t.measure("hello", 16.0, 20.0);
+        assert_eq!(m1.width, m2.width);
+        assert_eq!(t.measure_cache.len(), 1);
+    }
+
+    #[test]
+    fn clear_shape_cache_drops_entries() {
+        let mut t = TextResources::new();
+        let _ = t.shape("hello", 16.0, 20.0);
+        let _ = t.measure("hello", 16.0, 20.0);
+        t.clear_shape_cache();
+        assert!(t.shape_cache.is_empty());
+        assert!(t.measure_cache.is_empty());
     }
 }

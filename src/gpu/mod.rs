@@ -12,7 +12,7 @@ pub use context::{GpuContext, MemoryReport};
 pub use glyph_atlas::{AtlasEntry, GlyphAtlas};
 pub use image_atlas::{ImageAtlas, ImageEntry, ImageHandle};
 pub use instance::{
-    FrameUniform, ShapeInstance, SHAPE_KIND_GLASS, SHAPE_KIND_GLYPH, SHAPE_KIND_IMAGE,
+    FrameUniform, NO_CLIP, ShapeInstance, SHAPE_KIND_GLASS, SHAPE_KIND_GLYPH, SHAPE_KIND_IMAGE,
     SHAPE_KIND_RECT,
 };
 pub use overdraw::{OverdrawResources, OVERDRAW_FORMAT};
