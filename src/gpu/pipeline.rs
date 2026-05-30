@@ -177,7 +177,7 @@ impl ShapePipeline {
             contents: bytemuck::bytes_of(&FrameUniform {
                 screen_size: [1.0, 1.0],
                 max_backdrop_lod: 0.0,
-                _pad: 0.0,
+                window_corner_radius: 0.0,
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });

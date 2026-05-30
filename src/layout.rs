@@ -105,6 +105,13 @@ pub struct LayoutStyle {
     pub gap: f32,
     pub justify: Justify,
     pub align: Align,
+    /// Width-to-height ratio. When `Some`, the layout pass overrides
+    /// height = width / ratio after the child's width is resolved by
+    /// the parent flex pass. Width remains the driver — pair with
+    /// `w_px`, `w_pct`, `w(Fill)`, etc.; any explicit `h_*` is ignored
+    /// on this node. `aspect_ratio = 1.0` produces a square; `16.0/9.0`
+    /// a video tile; `2.0` a wide banner.
+    pub aspect_ratio: Option<f32>,
     /// When `Some`, the node is absolutely positioned at `[x, y]`
     /// relative to its parent's content-box origin and is skipped by
     /// flow layout. Root nodes treat `Some` as viewport-relative and
@@ -141,6 +148,7 @@ impl Default for LayoutStyle {
             gap: 0.0,
             justify: Justify::Start,
             align: Align::Start,
+            aspect_ratio: None,
             abs: None,
             overflow_x: Overflow::Visible,
             overflow_y: Overflow::Visible,
@@ -434,17 +442,36 @@ fn layout_children<M: Measurer>(
             Align::End => (cross_size - cross).max(0.0),
             Align::Center => ((cross_size - cross) * 0.5).max(0.0),
         };
-        let (x, y, w, h) = match style.axis {
+        let (x, y, w, mut h) = match style.axis {
             Axis::Row => (cursor, cross_start + align_offset, m, cross),
             Axis::Col => (cross_start + align_offset, cursor, cross, m),
         };
+        // Aspect-ratio constraint: width drives height. Pulled from the
+        // child's layout so a `.square()` / `.aspect_ratio(16.0/9.0)`
+        // call on the child takes effect *after* the parent's flex pass
+        // resolved its width. Width remains whatever flex computed
+        // (Fill / Px / Pct / Auto); height is rewritten and any
+        // explicit `h_*` on the child is discarded for this node.
+        let aspect = tree.get(c).and_then(|n| n.layout.aspect_ratio);
+        if let Some(ratio) = aspect {
+            h = w / ratio.max(f32::EPSILON);
+        }
         if let Some(n) = tree.get_mut_raw(c) {
             n.rect = [x, y, w, h];
         }
         max_x = max_x.max(x + w);
         max_y = max_y.max(y + h);
         layout_children(tree, c, measurer, scale);
-        cursor += m + gap + between_extra;
+        // Advance by the *actual* main-axis size, which for a Col
+        // parent is the (possibly aspect-ratio-overridden) height.
+        // Without this, siblings stack as if the override never
+        // happened — they sit at `cursor += original_m` and visually
+        // overlap the resized child below.
+        let main_consumed = match style.axis {
+            Axis::Row => w,
+            Axis::Col => h,
+        };
+        cursor += main_consumed + gap + between_extra;
     }
 
     // Absolute children: resolve against content box.

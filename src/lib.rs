@@ -40,6 +40,7 @@ pub mod input;
 pub mod layout;
 pub mod lazy_list;
 pub mod node;
+pub mod overlay;
 pub mod reactive;
 pub mod scene;
 pub mod signal;
@@ -76,6 +77,7 @@ pub use gpu::{
     MemoryReport, ShapeInstance,
 };
 pub use input::{InputChange, InputState};
+pub use overlay::Overlay;
 pub use layout::{Align, Axis, Justify, LayoutStyle, Len, Measurer, NullMeasurer, Overflow};
 pub use node::{
     dirty, BarSide, BorderSides, HitEntry, ImageRef, Node, NodeBuilder, NodeId, NodeTree,
@@ -84,10 +86,12 @@ pub use node::{
 };
 pub use reactive::{animated, AnimatedBind, Bind, Computed, DepTuple, ImageBind, Source, TextBind};
 pub use scene::{
-    BindRegistry, ColorBindSlot, ImageBindSlot, IntoNodeName, NodeBuilderRef, PositionBindSlot,
-    Scene, SceneCtx, SizeBindSlot, SubtreeRemoval, TextBindSlot, WidthPctBindSlot,
+    BindRegistry, ColorBindSlot, HeightPxBindSlot, ImageBindSlot, IntoNodeName, NodeBuilderRef,
+    PositionBindSlot, Scene, SceneCtx, SizeBindSlot, SubtreeRemoval, TextBindSlot,
+    WidthPctBindSlot, WidthPxBindSlot,
 };
 pub use signal::{Signal, TextSignal};
+pub use winit::window::CursorIcon;
 pub use svg::{rasterize_svg, rasterize_svg_to};
 pub use text::{RasterizedGlyph, ShapedGlyph, TextMetrics, TextResources};
 pub use uploader::Uploader;

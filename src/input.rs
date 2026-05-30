@@ -70,6 +70,11 @@ impl InputState {
     /// whose AABB contains the point. O(n) over interactive nodes only —
     /// `hits` is already filtered during flatten.
     pub fn hit_test(hits: &[HitEntry], x: f32, y: f32) -> Option<NodeId> {
+        // Topmost wins. `hits` is already reversed to front-to-back order
+        // at the end of the flatten pass (`NodeTree::flatten` →
+        // `hits.reverse()`), so the *first* containing entry is the
+        // frontmost. (`scroll_bars` is NOT reversed, which is why
+        // `press_scrollbar` iterates `.rev()` instead — different list.)
         hits.iter().find(|h| h.contains(x, y)).map(|h| h.node_id)
     }
 

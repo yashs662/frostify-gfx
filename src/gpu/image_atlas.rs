@@ -237,6 +237,131 @@ impl ImageAtlas {
         self.upload_rgba(queue, w, h, rgba)
     }
 
+    /// Auto-managed upload — the recommended path for consumer apps. Try
+    /// [`upload_rgba`]; on failure **grow** the atlas (doubling up to
+    /// `max_size`), retrying after each step; evict (`rebuild_keeping`)
+    /// only as a last resort once the atlas is already at `max_size`.
+    /// Returns `None` only when even a max-sized atlas (post-evict)
+    /// can't fit the bytes, or when `w`/`h` exceeds `max_size` itself.
+    ///
+    /// **Why grow before evict?** Consumer-side bursts (e.g. a Home
+    /// screen's worth of album art arriving back-to-back in one frame)
+    /// upload many images before any are rendered. The caller-supplied
+    /// `live` set comes from a tree walk, which only sees handles that
+    /// have been bound to a node + flushed — i.e. handles from the
+    /// previous frame's render. Just-uploaded handles from the same
+    /// drain pass are invisible to `live`. Evicting at that point
+    /// silently drops those handles, leaving consumers with stale
+    /// handles that point at recycled atlas slots. Growing keeps every
+    /// cached source intact, so a burst always lands.
+    pub fn upload_rgba_growing(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        w: u32,
+        h: u32,
+        rgba: &[u8],
+        live: &HashSet<ImageHandle>,
+        max_size: u32,
+    ) -> Option<ImageHandle> {
+        if let Some(handle) = self.upload_rgba(queue, w, h, rgba) {
+            return Some(handle);
+        }
+        // Try growing first — preserves every cached source, so an in-
+        // flight burst of uploads stays intact regardless of how stale
+        // the caller's `live` snapshot is.
+        while self.size < max_size {
+            let next = (self.size * 2).min(max_size);
+            if !self.grow(device, queue, next) {
+                break;
+            }
+            if let Some(handle) = self.upload_rgba(queue, w, h, rgba) {
+                return Some(handle);
+            }
+        }
+        // Last resort at max texture dimension: evict non-live + retry.
+        // At this point we know `live` is the best signal we have, and
+        // dropping anything not in it is the only way to make room.
+        self.rebuild_keeping(queue, live);
+        self.upload_rgba(queue, w, h, rgba)
+    }
+
+    /// Replace the underlying GPU texture with one of `new_size` and
+    /// re-upload every cached source into a fresh allocator. Bind group
+    /// is rebuilt; render code reads [`Self::bind_group`] per pass, so
+    /// callers don't need to rebind. No-op (returns `false`) when
+    /// `new_size <= self.size`.
+    pub fn grow(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        new_size: u32,
+    ) -> bool {
+        if new_size <= self.size {
+            return false;
+        }
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("frostify-gfx image atlas"),
+            size: wgpu::Extent3d {
+                width: new_size,
+                height: new_size,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // Sampler params don't depend on size; cheaper to recreate than
+        // to thread a stored sampler through the struct.
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("frostify-gfx image sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("frostify-gfx image atlas bg"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+        self.size = new_size;
+        self.texture = texture;
+        self.bind_group = bind_group;
+        self.allocator = AtlasAllocator::new(size2(new_size as i32, new_size as i32));
+        // Re-upload every source (live or not) — growing means we have
+        // room for all of them; cheaper than walking the tree to filter.
+        let snapshot: Vec<(ImageHandle, u32, u32, Vec<u8>)> = self
+            .sources
+            .iter()
+            .map(|(h, s)| (*h, s.width, s.height, s.rgba.clone()))
+            .collect();
+        self.occupants.clear();
+        for (handle, w, h, bytes) in snapshot {
+            if self.upload_internal(queue, w, h, &bytes, Some(handle)).is_none() {
+                self.occupants.remove(&handle);
+                self.sources.remove(&handle);
+            }
+        }
+        true
+    }
+
     /// Drop every cached source whose handle is missing from `live`,
     /// reset the allocator, and re-upload the survivors into a fresh
     /// atlas layout. Each surviving handle keeps its `ImageHandle`
@@ -517,5 +642,88 @@ mod tests {
         assert!(atlas.get(h2).is_none());
         let h3 = atlas.upload_rgba(&queue, 14, 14, &solid_rgba(14, 14, [3; 4]));
         assert!(h3.is_some(), "post-rebuild upload should succeed");
+    }
+
+    #[test]
+    fn grow_preserves_handles_and_makes_room() {
+        let (device, queue) = noop_device();
+        let mut atlas = ImageAtlas::new(&device, 32);
+        // 28² padded → 30×30; one fills the 32² atlas, a 2nd can't fit
+        // anywhere in the residual 2-px slivers.
+        let h1 = atlas
+            .upload_rgba(&queue, 28, 28, &solid_rgba(28, 28, [1; 4]))
+            .unwrap();
+        assert!(atlas.upload_rgba(&queue, 28, 28, &solid_rgba(28, 28, [2; 4])).is_none());
+        assert!(atlas.grow(&device, &queue, 64), "grow 32→64 should succeed");
+        assert_eq!(atlas.size(), 64);
+        // Original handle survives verbatim, re-uploaded into the bigger
+        // texture from the cached source bytes.
+        assert!(atlas.get(h1).is_some());
+        // Now there's room for the second.
+        assert!(atlas.upload_rgba(&queue, 28, 28, &solid_rgba(28, 28, [2; 4])).is_some());
+        // Growing to ≤ current size is a no-op.
+        assert!(!atlas.grow(&device, &queue, 64));
+        assert!(!atlas.grow(&device, &queue, 32));
+    }
+
+    #[test]
+    fn burst_uploads_with_stale_live_keep_every_handle() {
+        // Consumer scenario: many image uploads land in the same drain
+        // pass, before any of them have been bound + flushed into the
+        // tree. The caller's `live` set therefore omits them all. The
+        // growing path must keep every burst-uploaded handle alive
+        // (grow-before-evict) rather than silently dropping them.
+        let (device, queue) = noop_device();
+        let mut atlas = ImageAtlas::new(&device, 32);
+        let empty_live = HashSet::new();
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let h = atlas
+                .upload_rgba_growing(
+                    &device,
+                    &queue,
+                    28,
+                    28,
+                    &solid_rgba(28, 28, [i as u8 + 1; 4]),
+                    &empty_live,
+                    1024,
+                )
+                .expect("burst upload must succeed via grow");
+            handles.push(h);
+        }
+        // Every handle from the burst remains live in the atlas.
+        for h in &handles {
+            assert!(atlas.get(*h).is_some(), "burst handle {h:?} was evicted");
+        }
+        // Atlas grew at least once to fit the burst.
+        assert!(atlas.size() > 32, "atlas should have grown");
+    }
+
+    #[test]
+    fn upload_rgba_growing_doubles_until_it_fits() {
+        let (device, queue) = noop_device();
+        let mut atlas = ImageAtlas::new(&device, 32);
+        // Pin a 28² live handle so eviction can't reclaim its space —
+        // the grow path is the only way out for a second upload.
+        let live_h = atlas
+            .upload_rgba(&queue, 28, 28, &solid_rgba(28, 28, [1; 4]))
+            .unwrap();
+        let live: HashSet<_> = [live_h].into_iter().collect();
+        // Second 28² won't fit at 32² and eviction can't help (live_h
+        // pinned). Growing doubles 32→64 where both fit.
+        let h2 = atlas
+            .upload_rgba_growing(
+                &device,
+                &queue,
+                28,
+                28,
+                &solid_rgba(28, 28, [2; 4]),
+                &live,
+                256,
+            )
+            .expect("growing path should succeed");
+        assert!(atlas.size() > 32, "atlas must have grown");
+        assert!(atlas.get(h2).is_some());
+        assert!(atlas.get(live_h).is_some(), "live handle preserved across grow");
     }
 }

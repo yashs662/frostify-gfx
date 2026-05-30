@@ -146,6 +146,21 @@ impl SceneCtx {
             &mut self.binds.width_pct_free,
             |s| dropped_set.contains(&s.node_id),
         );
+        let _ = tombstone_matching(
+            &mut self.binds.width_px,
+            &mut self.binds.width_px_free,
+            |s| dropped_set.contains(&s.node_id),
+        );
+        let _ = tombstone_matching(
+            &mut self.binds.height_px,
+            &mut self.binds.height_px_free,
+            |s| dropped_set.contains(&s.node_id),
+        );
+        let _ = tombstone_matching(
+            &mut self.binds.opacity,
+            &mut self.binds.opacity_free,
+            |s| dropped_set.contains(&s.node_id),
+        );
 
         // Prune any named-node entries pointing at dropped ids.
         self.names.retain(|_, v| !dropped_set.contains(v));
@@ -246,6 +261,25 @@ pub struct BindRegistry {
     pub width_pct: Vec<Option<WidthPctBindSlot>>,
     /// Tombstoned `width_pct` indices available for reuse.
     pub width_pct_free: Vec<u32>,
+    /// Absolute-width binds (`layout.width = Len::Px(_)`). Like
+    /// `width_pct` but in physical-px-equivalent units — used for
+    /// user-resizable panels driven by a drag handle. Snaps (no tween);
+    /// animate the source for smooth motion.
+    pub width_px: Vec<Option<WidthPxBindSlot>>,
+    /// Tombstoned `width_px` indices available for reuse.
+    pub width_px_free: Vec<u32>,
+    /// Absolute-height binds (`layout.height = Len::Px(_)`). Mirror of
+    /// `width_px` for the cross axis.
+    pub height_px: Vec<Option<HeightPxBindSlot>>,
+    /// Tombstoned `height_px` indices available for reuse.
+    pub height_px_free: Vec<u32>,
+    /// Node-opacity binds. Drive `style.opacity`, which the flatten pass
+    /// multiplies down the subtree (group opacity) — so binding this on a
+    /// container fades the whole subtree together (modal fade-in/out).
+    /// Snaps per tick; animate the source signal for smooth motion.
+    pub opacity: Vec<Option<OpacityBindSlot>>,
+    /// Tombstoned `opacity` indices available for reuse.
+    pub opacity_free: Vec<u32>,
 }
 
 /// Store `slot`, reusing a tombstoned index from `free` if one exists
@@ -294,6 +328,24 @@ pub struct TextBindSlot {
 }
 
 pub struct WidthPctBindSlot {
+    pub node_id: NodeId,
+    pub bind: Bind<f32>,
+    pub last_version: u64,
+}
+
+pub struct WidthPxBindSlot {
+    pub node_id: NodeId,
+    pub bind: Bind<f32>,
+    pub last_version: u64,
+}
+
+pub struct HeightPxBindSlot {
+    pub node_id: NodeId,
+    pub bind: Bind<f32>,
+    pub last_version: u64,
+}
+
+pub struct OpacityBindSlot {
     pub node_id: NodeId,
     pub bind: Bind<f32>,
     pub last_version: u64,
@@ -747,6 +799,28 @@ impl<'a> NodeBuilderRef<'a> {
         self
     }
 
+    /// Width-to-height ratio constraint. Width remains the driver
+    /// (set via `w(Fill)` / `w_px` / `w_pct` / `width_px_bind`); the
+    /// layout pass overrides height to `width / ratio` after the
+    /// parent's flex pass resolves the width. Any explicit `h_*` set on
+    /// the same node is ignored. Common values:
+    /// - `1.0` — square (use [`Self::square`] for clarity)
+    /// - `16.0 / 9.0` — widescreen tile
+    /// - `4.0 / 3.0` — classic photo
+    pub fn aspect_ratio(&mut self, ratio: f32) -> &mut Self {
+        if let Some(n) = self.ctx.tree.get_mut_raw(self.id) {
+            n.layout.aspect_ratio = Some(ratio.max(f32::EPSILON));
+        }
+        self
+    }
+
+    /// Shortcut for [`Self::aspect_ratio`]`(1.0)` — height tracks width.
+    /// Pair with `w(Fill)` to get an album-cover-style square that
+    /// resizes with its container.
+    pub fn square(&mut self) -> &mut Self {
+        self.aspect_ratio(1.0)
+    }
+
     /// Constrain the text content to a maximum logical-px width;
     /// when the unconstrained shape exceeds it, the layout pass and
     /// glyph builder both substitute `prefix + "…"` truncation. No-op
@@ -865,6 +939,89 @@ impl<'a> NodeBuilderRef<'a> {
                 &mut self.ctx.binds.width_pct,
                 &mut self.ctx.binds.width_pct_free,
                 WidthPctBindSlot {
+                    node_id: self.id,
+                    bind,
+                    last_version: initial_version,
+                },
+            );
+        }
+        self
+    }
+
+    /// Reactive width in **logical pixels**, driven by an `f32` bind —
+    /// the absolute-size companion to [`Self::width_pct`]. Lets a
+    /// caller-owned `Signal<f32>` resize a panel without a scene
+    /// rebuild (e.g. a draggable splitter mutating the signal on every
+    /// cursor move). Snaps (no tween); animate the source for smooth
+    /// motion.
+    pub fn width_px_bind(&mut self, w: impl Into<Bind<f32>>) -> &mut Self {
+        let bind = w.into();
+        let initial = bind.read();
+        let initial_version = bind.version();
+        if let Some(n) = self.ctx.tree.get_mut_raw(self.id) {
+            n.layout.width = Len::Px(initial);
+        }
+        if !matches!(bind, Bind::Value(_)) {
+            alloc_slot(
+                &mut self.ctx.binds.width_px,
+                &mut self.ctx.binds.width_px_free,
+                WidthPxBindSlot {
+                    node_id: self.id,
+                    bind,
+                    last_version: initial_version,
+                },
+            );
+        }
+        self
+    }
+
+    /// Reactive height in **logical pixels**. Mirror of
+    /// [`Self::width_px_bind`] for the cross axis.
+    pub fn height_px_bind(&mut self, h: impl Into<Bind<f32>>) -> &mut Self {
+        let bind = h.into();
+        let initial = bind.read();
+        let initial_version = bind.version();
+        if let Some(n) = self.ctx.tree.get_mut_raw(self.id) {
+            n.layout.height = Len::Px(initial);
+        }
+        if !matches!(bind, Bind::Value(_)) {
+            alloc_slot(
+                &mut self.ctx.binds.height_px,
+                &mut self.ctx.binds.height_px_free,
+                HeightPxBindSlot {
+                    node_id: self.id,
+                    bind,
+                    last_version: initial_version,
+                },
+            );
+        }
+        self
+    }
+
+    /// Reactive node opacity (0..=1). Multiplies into the subtree's
+    /// effective alpha (group opacity — see the flatten pass), so binding
+    /// it on a container fades the whole subtree together. Ideal for a
+    /// modal/popup fade-in-out: tween a `Signal<f32>` and bind it here.
+    /// Snaps per tick; animate the source for smooth motion.
+    ///
+    /// A fully-transparent value (≤ 0.001) also marks the node
+    /// **invisible**, so the flatten pass skips it and its subtree
+    /// entirely — no render *and no hit-testing*. This is what stops a
+    /// faded-out overlay (e.g. a closed modal's full-window scrim) from
+    /// silently eating input while it's invisible.
+    pub fn opacity_bind(&mut self, o: impl Into<Bind<f32>>) -> &mut Self {
+        let bind = o.into();
+        let initial = bind.read();
+        let initial_version = bind.version();
+        if let Some(n) = self.ctx.tree.get_mut_raw(self.id) {
+            n.style.opacity = initial;
+            n.visible = initial > 0.001;
+        }
+        if !matches!(bind, Bind::Value(_)) {
+            alloc_slot(
+                &mut self.ctx.binds.opacity,
+                &mut self.ctx.binds.opacity_free,
+                OpacityBindSlot {
                     node_id: self.id,
                     bind,
                     last_version: initial_version,
@@ -1538,6 +1695,16 @@ impl<'a> NodeBuilderRef<'a> {
         let handler: crate::event::DropHandler = std::rc::Rc::new(f);
         if let Some(n) = self.ctx.tree.get_mut_raw(self.id) {
             n.on_drop = Some(handler);
+        }
+        self
+    }
+
+    /// Override the OS cursor while pointing at this node. Topmost
+    /// hit wins. Use for resize handles (`CursorIcon::EwResize` /
+    /// `NsResize`) or link affordances (`CursorIcon::Pointer`).
+    pub fn cursor(&mut self, icon: winit::window::CursorIcon) -> &mut Self {
+        if let Some(n) = self.ctx.tree.get_mut_raw(self.id) {
+            n.cursor = Some(icon);
         }
         self
     }

@@ -644,6 +644,11 @@ pub struct Node {
     /// following the cursor 1:1. The visual half of drag-and-drop —
     /// reorderable lists pair this with `drag_payload` + `on_drop`.
     pub drag_follow: bool,
+    /// Override the OS cursor while pointing at this node. None defers
+    /// to the app's default (edge-resize, window-action, etc.). Used by
+    /// resize handles (`EwResize` / `NsResize`) and link-ish affordances
+    /// (`Pointer`). Topmost hit wins.
+    pub cursor: Option<winit::window::CursorIcon>,
 }
 
 impl std::fmt::Debug for Node {
@@ -671,6 +676,7 @@ impl std::fmt::Debug for Node {
             .field("drag_payload", &self.drag_payload.as_ref().map(|_| "<payload>"))
             .field("on_drop", &self.on_drop.as_ref().map(|_| "<handler>"))
             .field("drag_follow", &self.drag_follow)
+            .field("cursor", &self.cursor)
             .finish()
     }
 }
@@ -702,6 +708,7 @@ impl Node {
                 drag_payload: None,
                 on_drop: None,
                 drag_follow: false,
+                cursor: None,
             },
         }
     }
@@ -800,6 +807,18 @@ impl NodeBuilder {
         self.node.layout.justify = Justify::Center;
         self.node.layout.align = Align::Center;
         self
+    }
+
+    /// Width-to-height ratio constraint. See
+    /// [`crate::scene::NodeBuilderRef::aspect_ratio`].
+    pub fn aspect_ratio(mut self, ratio: f32) -> Self {
+        self.node.layout.aspect_ratio = Some(ratio.max(f32::EPSILON));
+        self
+    }
+
+    /// Shortcut for `aspect_ratio(1.0)` — height tracks width.
+    pub fn square(self) -> Self {
+        self.aspect_ratio(1.0)
     }
 
     pub fn overflow(mut self, ox: crate::layout::Overflow, oy: crate::layout::Overflow) -> Self {
@@ -1086,6 +1105,13 @@ impl NodeBuilder {
     /// [`crate::scene::NodeBuilderRef::drag_follow`].
     pub fn drag_follow(mut self) -> Self {
         self.node.drag_follow = true;
+        self
+    }
+
+    /// Override the OS cursor while pointing at this node. See
+    /// [`crate::scene::NodeBuilderRef::cursor`].
+    pub fn cursor(mut self, icon: winit::window::CursorIcon) -> Self {
+        self.node.cursor = Some(icon);
         self
     }
 
@@ -2534,6 +2560,7 @@ impl NodeTree {
             || node.drag_payload.is_some()
             || node.on_drop.is_some()
             || node.drag_follow
+            || node.cursor.is_some()
         {
             hits.push(HitEntry {
                 node_id: id,

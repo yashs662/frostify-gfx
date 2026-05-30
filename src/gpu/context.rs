@@ -70,6 +70,11 @@ pub struct GpuContext {
     /// Cached frame timing read at the end of the last render. `None`
     /// when timing isn't available or hasn't been read yet.
     last_timing: Option<FrameTiming>,
+    /// Window-level corner radius in logical px applied by the final
+    /// shader as a clip SDF. `0.0` = square corners (no clip). Set via
+    /// [`Self::set_window_corner_radius`]; consumed by the next frame
+    /// uniform upload.
+    window_corner_radius: f32,
 }
 
 impl GpuContext {
@@ -149,9 +154,11 @@ impl GpuContext {
         );
 
         let glyph_atlas = GlyphAtlas::new(&device, 1024);
-        // 2048² (16 MiB RGBA) so multiple 640px album covers coexist
-        // without thrashing the eviction path. A single 640 cover nearly
-        // fills a 1024² atlas, forcing a repack on every track change.
+        // Start small (16 MiB). [`ImageAtlas::upload_rgba_growing`] —
+        // the path `App::upload_image_rgba` uses — auto-grows the
+        // texture (doubling, capped at the adapter's max 2D dimension)
+        // when consumer uploads outgrow the initial cap. Consumers
+        // never have to tune this.
         let image_atlas = ImageAtlas::new(&device, 2048);
         let shape = ShapePipeline::new(
             &device,
@@ -197,7 +204,7 @@ impl GpuContext {
             bytemuck::bytes_of(&FrameUniform {
                 screen_size: [width as f32, height as f32],
                 max_backdrop_lod: blur.mip_count().saturating_sub(1) as f32,
-                _pad: 0.0,
+                window_corner_radius: 0.0,
             }),
         );
 
@@ -229,6 +236,7 @@ impl GpuContext {
             timing,
             last_drawcalls: 0,
             last_timing: None,
+            window_corner_radius: 0.0,
         }
     }
 
@@ -247,7 +255,7 @@ impl GpuContext {
                     self.surface_config.height as f32,
                 ],
                 max_backdrop_lod: self.blur.mip_count().saturating_sub(1) as f32,
-                _pad: 0.0,
+                window_corner_radius: self.window_corner_radius,
             }),
         );
         // Blurred view changed — rebuild the glass bind group.
@@ -266,6 +274,26 @@ impl GpuContext {
 
     pub fn set_overdraw(&mut self, on: bool) {
         self.overdraw_mode = on;
+    }
+
+    /// Set the window-level corner radius (logical px). `0.0` disables
+    /// the clip. Re-uploads the frame uniform so the next render picks
+    /// it up; callers should pair this with `request_redraw` if the
+    /// loop is idle.
+    pub fn set_window_corner_radius(&mut self, r: f32, scale: f32) {
+        self.window_corner_radius = r.max(0.0) * scale;
+        self.queue.write_buffer(
+            &self.shape.frame_buffer,
+            0,
+            bytemuck::bytes_of(&FrameUniform {
+                screen_size: [
+                    self.surface_config.width as f32,
+                    self.surface_config.height as f32,
+                ],
+                max_backdrop_lod: self.blur.mip_count().saturating_sub(1) as f32,
+                window_corner_radius: self.window_corner_radius,
+            }),
+        );
     }
 
     /// Upload a complete instance list in painter's (declared) order.

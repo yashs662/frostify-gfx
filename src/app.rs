@@ -45,8 +45,8 @@ use crate::gpu::{FrameStats, GpuContext, ImageHandle, ShapeInstance};
 use crate::input::InputState;
 use crate::node::{FlatEvent, HitEntry, ScrollAxis, ScrollHit, ScrollbarHit, WindowAction};
 use crate::scene::{
-    ColorBindSlot, ImageBindSlot, PositionBindSlot, Scene, SceneCtx, SizeBindSlot, TextBindSlot,
-    WidthPctBindSlot,
+    ColorBindSlot, HeightPxBindSlot, ImageBindSlot, OpacityBindSlot, PositionBindSlot, Scene,
+    SceneCtx, SizeBindSlot, TextBindSlot, WidthPctBindSlot, WidthPxBindSlot,
 };
 
 /// Pixel band on each window edge that triggers a system resize-drag
@@ -75,6 +75,12 @@ pub struct AppConfig {
     pub transparent: bool,
     pub blur: bool,
     pub capture_dir: PathBuf,
+    /// Window-corner radius in logical px applied by the final shader.
+    /// `0.0` (default) = square corners; non-zero rounds the surface
+    /// against the transparent winit window. Automatically suppressed
+    /// when the window is maximised / fullscreen since edge rounding
+    /// against the work-area boundary just clips usable pixels.
+    pub window_corner_radius: f32,
 }
 
 impl AppConfig {
@@ -87,6 +93,7 @@ impl AppConfig {
             transparent: true,
             blur: true,
             capture_dir: PathBuf::from("debug_captures"),
+            window_corner_radius: 0.0,
         }
     }
 }
@@ -206,11 +213,32 @@ pub struct App {
     on_key: Option<KeyFn>,
     on_frame: Option<FrameFn>,
     on_unhandled_press: Option<UnhandledPressFn>,
+    /// One-shot hook fired from `exiting()` (winit's last chance before
+    /// the event loop tears down). Use for save-on-quit work — prefs
+    /// flush, session disconnect, etc. `Option` so it can be `take`n
+    /// (`FnOnce`-style) on first fire.
+    on_exit: Option<Box<dyn FnOnce()>>,
     headless: Option<HeadlessFn>,
     /// Number of still frames to capture and exit after, or `None` for
     /// a normal interactive run. `Some(n)` triggers headless capture
     /// mode in `resumed`.
     capture_frames: Option<u32>,
+    /// Optional delay before the autocapture fires. `None` = capture on
+    /// the first rendered frame (legacy behaviour). `Some(d)` lets the
+    /// event loop run normally for `d`, then captures + exits. Useful
+    /// when the UI needs async data (worker fetches, image uploads) to
+    /// land before the snapshot makes sense.
+    capture_delay: Option<Duration>,
+    /// Set in `resumed` when `capture_delay` is `Some`. `about_to_wait`
+    /// polls against this; once `now >= deadline` it triggers the
+    /// pending capture + exits the loop.
+    capture_deadline: Option<Instant>,
+    /// Background thread that owns the PNG encode + disk write from the
+    /// most recent screenshot. Held so exit paths can join before the
+    /// process tears down — otherwise an `event_loop.exit()` triggered
+    /// shortly after F2 / autocapture would interrupt the encoder
+    /// mid-write and leave a truncated file behind.
+    pending_screenshot: Option<std::thread::JoinHandle<()>>,
     /// Last dirty bitmask consumed by `flush_tree`. Cleared on read by
     /// `take_dirty`, so we cache it for later stat dumps.
     last_dirty_mask: u32,
@@ -388,8 +416,12 @@ impl App {
             on_key: None,
             on_frame: None,
             on_unhandled_press: None,
+            on_exit: None,
             headless: None,
             capture_frames: None,
+            capture_delay: None,
+            capture_deadline: None,
+            pending_screenshot: None,
             last_dirty_mask: 0,
             last_cpu_ms: 0.0,
             last_render_stats: None,
@@ -519,6 +551,16 @@ impl App {
         self
     }
 
+    /// Hook fired once when the event loop is exiting — winit's
+    /// `exiting()` callback. Use for save-on-quit work (persist prefs,
+    /// disconnect remote sessions, flush logs). Fires whether the exit
+    /// was triggered by the close button, `event_loop.exit()`, or a
+    /// kill signal that lets winit unwind cleanly.
+    pub fn on_exit<F: FnOnce() + 'static>(mut self, f: F) -> Self {
+        self.on_exit = Some(Box::new(f));
+        self
+    }
+
     /// Register the outside-press hook. Fires on a
     /// left-button press that lands on no interactive node, or on a
     /// node tagged [`crate::scene::NodeBuilderRef::dismiss_transparent`].
@@ -554,17 +596,36 @@ impl App {
         self.capture(1, "debug_captures")
     }
 
+    /// Delay before the autocapture fires, in addition to whatever
+    /// `capture_frames` requested. Lets the loop tick normally for `d`
+    /// (worker responses, image uploads, animations all run) and then
+    /// snaps the final frame. Cumulative with both `capture_once` and
+    /// `capture(N, dir)`.
+    pub fn capture_delay(mut self, d: Duration) -> Self {
+        self.capture_delay = Some(d);
+        self
+    }
+
     /// Env-var shim for the legacy `FROSTIFY_AUTOCAPTURE` flag.
     /// Returns `self` unchanged when the variable is not set, so the
     /// call is harmless in normal interactive runs. CI/self-verify
     /// keeps working without code changes; scripted multi-frame flows
     /// still use [`App::headless`] separately.
-    pub fn capture_from_env(self) -> Self {
+    ///
+    /// Also honours `FROSTIFY_AUTOCAPTURE_DELAY_MS` (integer ms) — if
+    /// set, the autocapture is deferred by that long so async UI state
+    /// has time to populate before the snapshot.
+    pub fn capture_from_env(mut self) -> Self {
         if std::env::var_os("FROSTIFY_AUTOCAPTURE").is_some() {
-            self.capture_once()
-        } else {
-            self
+            self = self.capture_once();
         }
+        if let Some(raw) = std::env::var_os("FROSTIFY_AUTOCAPTURE_DELAY_MS")
+            && let Ok(s) = raw.into_string()
+            && let Ok(ms) = s.trim().parse::<u64>()
+        {
+            self = self.capture_delay(Duration::from_millis(ms));
+        }
+        self
     }
 
     /// Provide a one-shot scripted headless callback. The closure
@@ -584,6 +645,17 @@ impl App {
     /// Window decoration flag. Default `false` (frameless).
     pub fn decorations(mut self, on: bool) -> Self {
         self.config.decorations = on;
+        self
+    }
+
+    /// Round the window's four corners by `r` logical px. Implemented
+    /// as an SDF clip in the final fragment shader, so it's free
+    /// (~one extra ALU op per fragment) and works against the existing
+    /// transparent winit surface. Automatically zeroed out while the
+    /// window is maximised / fullscreen — rounding flush against the
+    /// work-area boundary clips usable pixels for no visual gain.
+    pub fn window_corner_radius(mut self, r: f32) -> Self {
+        self.config.window_corner_radius = r.max(0.0);
         self
     }
 
@@ -794,9 +866,19 @@ impl App {
     ) -> Option<crate::gpu::ImageHandle> {
         let live = collect_live_image_handles(&self.ctx.tree);
         let gpu = self.gpu.as_mut()?;
-        let handle = gpu
-            .image_atlas
-            .upload_rgba_or_evict(&gpu.queue, w, h, bytes, &live)?;
+        // Cap atlas growth at the adapter's max 2D texture dimension —
+        // 8192² with wgpu default limits, up to 16384² on most desktop
+        // adapters if higher limits are requested.
+        let max = gpu.device.limits().max_texture_dimension_2d;
+        let handle = gpu.image_atlas.upload_rgba_growing(
+            &gpu.device,
+            &gpu.queue,
+            w,
+            h,
+            bytes,
+            &live,
+            max,
+        )?;
         // Force a re-flatten so any node still pointing at a handle
         // whose UV moved during rebuild rebuilds its instance with
         // the fresh atlas slot.
@@ -855,6 +937,9 @@ impl App {
         process_image_binds(&mut self.ctx.binds.image, &mut self.ctx.tree);
         process_text_binds(&mut self.ctx.binds.text, &mut self.ctx.tree);
         process_width_pct_binds(&mut self.ctx.binds.width_pct, &mut self.ctx.tree);
+        process_width_px_binds(&mut self.ctx.binds.width_px, &mut self.ctx.tree);
+        process_height_px_binds(&mut self.ctx.binds.height_px, &mut self.ctx.tree);
+        process_opacity_binds(&mut self.ctx.binds.opacity, &mut self.ctx.tree);
     }
 
     /// For animated binds, copy the current `displayed` signal value
@@ -1817,6 +1902,31 @@ impl App {
         self.ctx.tree.get(id).and_then(|n| n.window_action)
     }
 
+    /// Cursor for the topmost interactive node under `(x, y)`: an explicit
+    /// [`crate::scene::NodeBuilderRef::cursor`] if set, otherwise
+    /// [`CursorIcon::Pointer`] for any node carrying an `on_click` — so
+    /// every clickable element presents the clickable affordance without
+    /// each call site having to tag a cursor by hand. Hits are stored
+    /// topmost-first (after the flatten reverse), so the first match wins;
+    /// an explicit cursor on a node above wins over a click below it.
+    fn hovered_node_cursor(&self, x: f32, y: f32) -> Option<CursorIcon> {
+        for entry in &self.hits {
+            if !entry.contains(x, y) {
+                continue;
+            }
+            let Some(n) = self.ctx.tree.get(entry.node_id) else {
+                continue;
+            };
+            if let Some(c) = n.cursor {
+                return Some(c);
+            }
+            if n.on_click.is_some() {
+                return Some(CursorIcon::Pointer);
+            }
+        }
+        None
+    }
+
     /// Pick the right cursor icon for `(x, y)` and push it to the
     /// window if it changed. Edge gutters win over node hover so the
     /// title bar's drag cursor doesn't fight the corner-resize cursor.
@@ -1830,6 +1940,8 @@ impl App {
                 | WindowAction::Minimize
                 | WindowAction::ToggleMaximize => CursorIcon::Pointer,
             }
+        } else if let Some(c) = self.hovered_node_cursor(x, y) {
+            c
         } else {
             CursorIcon::Default
         };
@@ -1872,19 +1984,35 @@ impl App {
     }
 
     fn save_screenshot(&mut self) {
-        let Some(gpu) = self.gpu.as_mut() else {
+        if self.gpu.is_none() {
             return;
-        };
+        }
+        // Wait for any previous F2 capture to finish before starting a
+        // new one. Bounded by encode-rate (~100 ms with Fast compression)
+        // so spam-pressing F2 stays responsive without overlapping
+        // threads racing on the file system.
+        self.flush_pending_screenshot();
+        let gpu = self.gpu.as_mut().expect("gpu just checked");
         let (rgba, w, h) = gpu.capture_rgba();
         let path = debug::screenshot_path(&self.config.capture_dir);
-        match debug::save_png(&path, &rgba, w, h) {
-            Ok(()) => log::info!("screenshot saved: {}", path.display()),
-            Err(e) => log::error!("screenshot failed: {e}"),
-        }
         let stats = self
             .last_render_stats
             .unwrap_or_else(|| self.current_stats());
         debug::write_stats_sidecar(&path, &stats);
+        // Encode + write off-thread so F2 in the middle of an
+        // interactive session doesn't freeze winit for 1–5 s. Sidecar
+        // is small and inline; the PNG is the expensive part.
+        self.pending_screenshot = Some(debug::save_png_async(path, rgba, w, h));
+    }
+
+    /// Block until the most recent async screenshot finishes encoding
+    /// + writing. Called from exit paths so a fast-exit-after-capture
+    /// (autocapture deadline, exiting()) doesn't kill the encoder
+    /// mid-write and leave a truncated PNG.
+    fn flush_pending_screenshot(&mut self) {
+        if let Some(handle) = self.pending_screenshot.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -2122,6 +2250,56 @@ fn process_width_pct_binds(
         // blur_source — a progress fill isn't, so a per-frame width
         // animation stays cheap (no full-window blur re-run).
         tree.set_layout_width(slot.node_id, crate::layout::Len::Pct(slot.bind.read()));
+    }
+}
+
+fn process_width_px_binds(
+    slots: &mut [Option<WidthPxBindSlot>],
+    tree: &mut crate::node::NodeTree,
+) {
+    for opt in slots.iter_mut() {
+        let Some(slot) = opt.as_mut() else { continue };
+        let v = slot.bind.version();
+        if v == slot.last_version {
+            continue;
+        }
+        slot.last_version = v;
+        tree.set_layout_width(slot.node_id, crate::layout::Len::Px(slot.bind.read()));
+    }
+}
+
+fn process_height_px_binds(
+    slots: &mut [Option<HeightPxBindSlot>],
+    tree: &mut crate::node::NodeTree,
+) {
+    for opt in slots.iter_mut() {
+        let Some(slot) = opt.as_mut() else { continue };
+        let v = slot.bind.version();
+        if v == slot.last_version {
+            continue;
+        }
+        slot.last_version = v;
+        tree.set_layout_height(slot.node_id, crate::layout::Len::Px(slot.bind.read()));
+    }
+}
+
+fn process_opacity_binds(
+    slots: &mut [Option<OpacityBindSlot>],
+    tree: &mut crate::node::NodeTree,
+) {
+    for opt in slots.iter_mut() {
+        let Some(slot) = opt.as_mut() else { continue };
+        let v = slot.bind.version();
+        if v == slot.last_version {
+            continue;
+        }
+        slot.last_version = v;
+        let o = slot.bind.read();
+        tree.set_opacity(slot.node_id, o);
+        // Fully transparent → drop the node (and its subtree) from
+        // flatten so an invisible overlay can't eat input. Restored the
+        // instant opacity rises above the threshold again.
+        tree.set_visible(slot.node_id, o > 0.001);
     }
 }
 
@@ -2437,6 +2615,20 @@ impl ApplicationHandler for App {
     /// `about_to_wait`.
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _: ()) {}
 
+    /// Last call before the loop tears down. Forward to the consumer's
+    /// `on_exit` hook (registered via [`App::on_exit`]) so save-on-quit
+    /// work runs deterministically — covers the close-button path, an
+    /// `event_loop.exit()` triggered by a callback, and any clean signal.
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(hook) = self.on_exit.take() {
+            hook();
+        }
+        // Wait for any in-flight PNG encode to finish writing — the
+        // autocapture + exit path otherwise truncates the file when
+        // the process tears down mid-write.
+        self.flush_pending_screenshot();
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -2476,6 +2668,17 @@ impl ApplicationHandler for App {
             (phys.height as f32 / s).round() as u32,
         ];
         self.gpu = Some(GpuContext::new(Arc::clone(&window_arc)));
+        // Apply the configured window-corner radius — suppressed while
+        // maximised so the radius doesn't clip against the work-area
+        // edge. Toggle is re-evaluated on every resize below.
+        let initial_r = if window_arc.is_maximized() {
+            0.0
+        } else {
+            self.config.window_corner_radius
+        };
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.set_window_corner_radius(initial_r, self.scale_factor);
+        }
         self.window = Some(window_arc);
         log::info!("display scale: {}", self.scale_factor);
 
@@ -2521,6 +2724,17 @@ impl ApplicationHandler for App {
         if let Some(w) = &self.window {
             w.set_visible(true);
             w.request_redraw();
+        }
+
+        // Deferred autocapture: arm a deadline + let the loop run
+        // normally. `about_to_wait` picks the deadline up + drives the
+        // capture once the wall-clock elapses, so worker fetches,
+        // image uploads, and animations all settle before the snap.
+        if self.capture_frames.is_some()
+            && let Some(d) = self.capture_delay
+        {
+            self.capture_deadline = Some(Instant::now() + d);
+            return;
         }
 
         if let Some(n) = self.capture_frames {
@@ -2577,6 +2791,20 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(size) => {
                 if let Some(g) = self.gpu.as_mut() {
                     g.resize(size.width, size.height);
+                }
+                // Re-evaluate the window corner radius — Resized fires
+                // on maximize/restore transitions on Windows + Linux,
+                // so this is the canonical hook to switch between
+                // "rounded floating window" and "square maximised".
+                if self.config.window_corner_radius > 0.0
+                    && let (Some(w), Some(g)) = (self.window.as_ref(), self.gpu.as_mut())
+                {
+                    let r = if w.is_maximized() {
+                        0.0
+                    } else {
+                        self.config.window_corner_radius
+                    };
+                    g.set_window_corner_radius(r, self.scale_factor);
                 }
                 let in_dpi_window = self
                     .last_dpi_change
@@ -2666,13 +2894,16 @@ impl ApplicationHandler for App {
                 let x = position.x as f32;
                 let y = position.y as f32;
                 self.input.cursor = Some([x, y]);
-                if self.bar_drag.is_some() {
+                if self.bar_drag.is_some() || self.drag_origin.is_some() {
                     // Coalesce: don't apply per OS event. Stash the
                     // latest cursor and let `about_to_wait` push it
-                    // through at frame rate. Skips hover refresh + the
-                    // hit-test path during drag (cursor is captured by
-                    // the thumb anyway). Ensure the loop wakes up so
-                    // the pending cursor gets applied promptly.
+                    // through at frame rate. OS cursor fires at 500+ Hz
+                    // and a generic on_drag handler (e.g. a splitter
+                    // mutating a width signal) would otherwise relayout
+                    // 8× per displayed frame for no visual gain. Skips
+                    // hover refresh + the hit-test path during drag
+                    // (cursor is captured anyway). Ensure the loop wakes
+                    // up so the pending cursor gets applied promptly.
                     self.pending_drag_cursor = Some([x, y]);
                     self.request_redraw();
                     return;
@@ -3113,6 +3344,19 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Deferred autocapture: once the deadline elapses, render a
+        // settled frame, snap, and exit. Loop has been running normally
+        // up to this point so worker state, image uploads, and any
+        // animations have all had a chance to land.
+        if let Some(deadline) = self.capture_deadline
+            && Instant::now() >= deadline
+        {
+            self.capture_deadline = None;
+            self.render_once();
+            self.save_screenshot();
+            event_loop.exit();
+            return;
+        }
         // Consume any rebuild request first — if a click handler
         // flipped the token mid-event, the old tree is stale and
         // every subsequent tick (animation, scroll, etc.) would
@@ -3164,18 +3408,27 @@ impl ApplicationHandler for App {
         // Drain any coalesced thumb-drag cursor: a single
         // set_scroll_immediate per frame, regardless of how many
         // CursorMoved events fired since the last tick.
-        let drag_moved = if let (Some(d), Some(c)) = (self.bar_drag, self.pending_drag_cursor) {
-            self.pending_drag_cursor = None;
-            crate::input::drag_to(
-                c,
-                d.node_id,
-                d.axis,
-                d.pointer_origin,
-                d.scroll_origin,
-                d.track_travel,
-                d.max_offset,
-                &mut self.ctx.tree,
-            )
+        let drag_moved = if let Some(c) = self.pending_drag_cursor.take() {
+            // Two drag mechanisms, both fed from the same coalesced
+            // cursor: scrollbar thumb (bar_drag) and generic on_drag
+            // (e.g. splitter). Either can be active independently.
+            let bar = if let Some(d) = self.bar_drag {
+                crate::input::drag_to(
+                    c,
+                    d.node_id,
+                    d.axis,
+                    d.pointer_origin,
+                    d.scroll_origin,
+                    d.track_travel,
+                    d.max_offset,
+                    &mut self.ctx.tree,
+                )
+            } else {
+                false
+            };
+            let generic = self.fire_drag(c[0], c[1]);
+            let following = self.update_drag_follow(c[0], c[1]);
+            bar || generic || following
         } else {
             false
         };
@@ -3300,6 +3553,14 @@ impl ApplicationHandler for App {
             (None, None) => None,
         };
         let combined = match (combined, dwell_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        // Make sure the loop wakes by the deferred-capture deadline so
+        // we don't park indefinitely while waiting to snap.
+        let combined = match (combined, self.capture_deadline) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (Some(a), None) => Some(a),
             (None, Some(b)) => Some(b),
@@ -3721,6 +3982,58 @@ mod tests {
         app.finish_drag_on_release();
         assert_eq!(got.get(), None, "drop must not fire off-target");
         assert!(app.drag_payload.is_none(), "payload still cleared");
+    }
+
+    #[test]
+    fn cursor_override_picked_from_hovered_node() {
+        let mut app = App::new("test", 200, 200).scene(|s| {
+            s.rect("handle")
+                .size_px(20.0, 100.0)
+                .cursor(CursorIcon::EwResize);
+        });
+        let _ = app.flush_tree();
+        // Inside the handle's rect (0,0..20,100): returns the override.
+        assert_eq!(app.hovered_node_cursor(10.0, 50.0), Some(CursorIcon::EwResize));
+        // Outside: no override → falls back to default in refresh_cursor.
+        assert_eq!(app.hovered_node_cursor(150.0, 50.0), None);
+    }
+
+    #[test]
+    fn width_px_bind_updates_layout_on_signal_change() {
+        let w = Signal::new(200.0_f32);
+        let w_for_scene = w.clone();
+        let mut app = App::new("test", 800, 400).scene(move |s| {
+            s.rect("panel").width_px_bind(w_for_scene.clone()).h_px(40.0);
+        });
+        let _ = app.flush_tree();
+        let id = app.ctx().node("panel").unwrap();
+        let initial = app.ctx().tree.get(id).unwrap().rect[2];
+        assert!((initial - 200.0).abs() < 0.5, "initial width = signal");
+        // Mutate the signal → bind processing snaps the new value into
+        // the tree's layout width → next flush re-runs layout.
+        w.set(360.0);
+        app.process_binds(Instant::now());
+        let _ = app.flush_tree();
+        let resized = app.ctx().tree.get(id).unwrap().rect[2];
+        assert!((resized - 360.0).abs() < 0.5, "width follows signal: got {resized}");
+    }
+
+    #[test]
+    fn height_px_bind_updates_layout_on_signal_change() {
+        let h = Signal::new(60.0_f32);
+        let h_for_scene = h.clone();
+        let mut app = App::new("test", 400, 600).scene(move |s| {
+            s.rect("panel").w_px(120.0).height_px_bind(h_for_scene.clone());
+        });
+        let _ = app.flush_tree();
+        let id = app.ctx().node("panel").unwrap();
+        let initial = app.ctx().tree.get(id).unwrap().rect[3];
+        assert!((initial - 60.0).abs() < 0.5);
+        h.set(180.0);
+        app.process_binds(Instant::now());
+        let _ = app.flush_tree();
+        let resized = app.ctx().tree.get(id).unwrap().rect[3];
+        assert!((resized - 180.0).abs() < 0.5, "got {resized}");
     }
 
     #[test]

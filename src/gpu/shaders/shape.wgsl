@@ -60,7 +60,11 @@ struct Frame {
     /// radii don't punch through the bottom of the pyramid (a 1×1
     /// mip is just an average of the whole frame).
     max_backdrop_lod: f32,
-    _pad: f32,
+    /// Window-corner clip radius in physical px. `0` disables the
+    /// clip; otherwise the final-pass fragment shader masks every
+    /// fragment by a rounded-rect SDF covering the whole surface so
+    /// the corner pixels stay transparent.
+    window_corner_radius: f32,
 }
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -343,6 +347,21 @@ fn fs_opaque(in: VSOut) -> @location(0) vec4<f32> {
     return vec4<f32>(out_rgb, out_a) * inst.opacity;
 }
 
+// Coverage of the window-corner SDF at `px`. `1.0` inside the rounded
+// boundary, `0.0` outside, with sub-pixel anti-aliasing at the rim.
+// `1.0` when the radius is disabled — caller can multiply unconditionally.
+fn window_corner_coverage(px: vec2<f32>) -> f32 {
+    if (frame.window_corner_radius <= 0.0) {
+        return 1.0;
+    }
+    let win_half = frame.screen_size * 0.5;
+    let win_p = px - win_half;
+    let win_r = vec4<f32>(frame.window_corner_radius);
+    let win_d = sd_rounded_rect(win_p, win_half, win_r);
+    let win_aa = max(fwidth(win_d), 0.5);
+    return smoothstep(win_aa, -win_aa, win_d);
+}
+
 // Fragment entry for the final surface pass. Handles glass by sampling
 // the pre-blurred backdrop texture.
 @fragment
@@ -353,6 +372,12 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         px.x > inst.clip_rect.z || px.y > inst.clip_rect.w) {
         discard;
     }
+    // Window-corner clip applies to every shape kind. Each branch
+    // multiplies its final output by `win_cov` so glyphs, images, and
+    // glass all respect the rounded boundary — the original
+    // implementation only clipped the generic rect path, which left
+    // the album-art image visible in the corners.
+    let win_cov = window_corner_coverage(px);
 
     if ((inst.shape_kind & SHAPE_KIND_MASK) == SHAPE_KIND_GLYPH) {
         // `backdrop_uv_rect` = (u0, v0, w, h) into the R8 glyph atlas.
@@ -366,7 +391,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         let cov = textureSampleLevel(glyph_tex, glyph_samp, uv, 0.0).r;
         let rgb_lin = srgb_to_linear(inst.color.rgb);
         let a = inst.color.a * cov * inst.opacity;
-        return vec4<f32>(rgb_lin * a, a);
+        return vec4<f32>(rgb_lin * a, a) * win_cov;
     }
 
     if ((inst.shape_kind & SHAPE_KIND_MASK) == SHAPE_KIND_IMAGE) {
@@ -389,7 +414,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         let tint_lin = srgb_to_linear(inst.color.rgb);
         let a = sample.a * inst.color.a * inst.opacity * comp_alpha;
         let rgb = sample.rgb * tint_lin * a;
-        return vec4<f32>(rgb, a);
+        return vec4<f32>(rgb, a) * win_cov;
     }
 
     let center = inst.position + inst.size * 0.5;
@@ -475,5 +500,5 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let shadow = compute_shadow(inst, px, center, outer_half);
     let out_a = body.a + shadow.a * (1.0 - body.a);
     let out_rgb = body.rgb + shadow.rgb * (1.0 - body.a);
-    return vec4<f32>(out_rgb, out_a) * inst.opacity;
+    return vec4<f32>(out_rgb, out_a) * inst.opacity * win_cov;
 }

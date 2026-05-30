@@ -125,5 +125,11 @@ impl ShapeInstance {
 pub struct FrameUniform {
     pub screen_size: [f32; 2],
     pub max_backdrop_lod: f32,
-    pub _pad: f32,
+    /// Logical-to-physical scale applied for the window-corner clip
+    /// SDF in the shader. `0.0` disables the corner clip entirely
+    /// (square window, fullscreen, etc.). Otherwise the fragment shader
+    /// in the final pass discards pixels outside a rounded rect with
+    /// this corner radius — gives the whole window rounded corners
+    /// without an extra render pass.
+    pub window_corner_radius: f32,
 }
