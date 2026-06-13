@@ -91,6 +91,24 @@ pub struct HoverCtx<'a> {
 /// A node-bound hover-move callback. See [`HoverCtx`].
 pub type HoverHandler = Rc<dyn for<'a> Fn(&mut HoverCtx<'a>) + 'static>;
 
+/// Context handed to an `on_wheel` callback — a wheel tick over the node.
+/// Fires INSTEAD of scroll-container routing (the handler consumes the
+/// event), so a slider can sit inside a scrollable page without wheel
+/// adjustments also scrolling the page. `delta` is in wheel lines,
+/// positive y = wheel forward/up; `rect` is the node's absolute hit rect
+/// `[x, y, w, h]` (physical px).
+pub struct WheelCtx<'a> {
+    pub tree: &'a mut NodeTree,
+    pub node: NodeId,
+    pub delta: [f32; 2],
+    pub rect: [f32; 4],
+    /// Display scale factor (physical px per logical px).
+    pub scale: f32,
+}
+
+/// A node-bound wheel callback. See [`WheelCtx`].
+pub type WheelHandler = Rc<dyn for<'a> Fn(&mut WheelCtx<'a>) + 'static>;
+
 /// Context handed to a [`DropHandler`]. Fires when a left-press release
 /// lands over this drop-target node while a drag payload is in flight.
 /// `payload` is the type-erased value the drag source carried — the

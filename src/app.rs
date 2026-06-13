@@ -1907,6 +1907,35 @@ impl App {
         true
     }
 
+    /// Fire the topmost `on_wheel` handler under the cursor, consuming the
+    /// wheel tick (no scroll routing). `delta` is in wheel lines, positive
+    /// y = wheel forward/up. Returns true if a handler ran. Entries
+    /// without a wheel handler are skipped (a hoverable row above a
+    /// slider doesn't swallow the tick), so only nodes that opted in
+    /// intercept wheel input.
+    fn fire_wheel(&mut self, x: f32, y: f32, delta: [f32; 2]) -> bool {
+        let Some((node, rect, h)) = self.hits.iter().find_map(|e| {
+            if !e.contains(x, y) {
+                return None;
+            }
+            let h = self.ctx.tree.get(e.node_id).and_then(|n| n.on_wheel.clone())?;
+            let b = e.bounds;
+            Some((e.node_id, [b[0], b[1], b[2] - b[0], b[3] - b[1]], h))
+        }) else {
+            return false;
+        };
+        let scale = self.scale_factor;
+        let mut wctx = crate::event::WheelCtx {
+            tree: &mut self.ctx.tree,
+            node,
+            delta,
+            rect,
+            scale,
+        };
+        h(&mut wctx);
+        true
+    }
+
     /// On left-release, deliver any in-flight drag payload to the topmost
     /// drop target under the cursor, then animate a lifted node back to
     /// its resting slot. No-op when nothing was being dragged.
@@ -2116,6 +2145,29 @@ impl App {
     ///
     /// No-op if [`App::scene`] was never called.
     pub fn rebuild_scene(&mut self) {
+        // 0. Snapshot EVERY scroller's offset (named or anonymous). A
+        //    rebuild is often additive UI (a modal opening, a hot-patch)
+        //    — teleporting any list back to the top would lose the
+        //    user's place. Restored (clamped against the fresh layout)
+        //    after the new tree flushes. Identity is [`scroll_identity`]:
+        //    the node's name when named, else its structural path — so
+        //    preservation is the DEFAULT, and a page that must reset on
+        //    navigation opts out by scoping its name to its content
+        //    (e.g. `detail_scroll:<id>` — new content ⇒ new identity ⇒
+        //    fresh scroll).
+        let saved_scroll: Vec<(String, [f32; 2])> = self
+            .ctx
+            .tree
+            .scrollables()
+            .to_vec()
+            .into_iter()
+            .filter_map(|id| {
+                let off = self.ctx.tree.scroll_offset(id);
+                (off != [0.0, 0.0])
+                    .then(|| scroll_identity(&self.ctx, id).map(|key| (key, off)))
+                    .flatten()
+            })
+            .collect();
         // 1. Snapshot the root list, then drop each subtree. Iterating
         //    `tree.roots()` directly while removing would alias the
         //    same Vec.
@@ -2159,6 +2211,35 @@ impl App {
         //    changed; rebuild always changes everything.
         if self.flush_tree() {
             self.request_redraw();
+        }
+        // 4b. Restore the scroll snapshot now that layout ran (clamping
+        //     needs the fresh content sizes), then flush again so lazy
+        //     windows re-materialize at the restored offset before the
+        //     first paint instead of flashing the top of the list.
+        //     Identities are recomputed against the NEW tree and matched
+        //     to the snapshot — keys are computed first (shared borrow),
+        //     then applied (mutable borrow).
+        if !saved_scroll.is_empty() {
+            let saved: std::collections::HashMap<String, [f32; 2]> =
+                saved_scroll.into_iter().collect();
+            let matches: Vec<(crate::node::NodeId, [f32; 2])> = self
+                .ctx
+                .tree
+                .scrollables()
+                .to_vec()
+                .into_iter()
+                .filter_map(|id| {
+                    let key = scroll_identity(&self.ctx, id)?;
+                    saved.get(&key).map(|&off| (id, off))
+                })
+                .collect();
+            let restored = !matches.is_empty();
+            for (id, off) in matches {
+                self.ctx.tree.restore_scroll(id, off);
+            }
+            if restored && self.flush_tree() {
+                self.request_redraw();
+            }
         }
         // 5. Re-derive hover from the preserved cursor against the
         //    freshly-flattened hit cache. Mirrors the WindowEvent::
@@ -2597,6 +2678,54 @@ fn build_hud_instances(
         .collect();
     out.extend(gpu.build_glyph_instances(text, &refs));
     out
+}
+
+/// Stable identity of a scroll node across scene rebuilds — what lets
+/// [`App::rebuild_scene`] hand a destroyed scroller's offset to its
+/// reincarnation in the new tree.
+///
+/// A named node IS its name (precise, and the app's opt-out lever: a
+/// content-scoped name like `detail_scroll:<id>` changes identity with
+/// the content, resetting scroll on navigation). An anonymous node is
+/// its nearest named ancestor plus the child-index path down from it —
+/// structural identity, so anonymous scrollers (a sidebar, a settings
+/// list) survive rebuilds by default. Best-effort by construction: a
+/// conditional sibling appearing *before* an anonymous scroller shifts
+/// its path and the offset resets (never mis-corrupts — name the
+/// scroller when its position isn't structurally stable).
+fn scroll_identity(ctx: &SceneCtx, id: crate::node::NodeId) -> Option<String> {
+    // Reverse name lookup. Built per call — rebuilds are rare, one-shot
+    // events and the maps are small; precise beats cached-and-stale.
+    let named: std::collections::HashMap<crate::node::NodeId, &str> =
+        ctx.names.iter().map(|(k, &v)| (v, k.as_str())).collect();
+    ctx.tree.get(id)?;
+    let mut segments: Vec<String> = Vec::new();
+    let mut cur = id;
+    loop {
+        if let Some(name) = named.get(&cur) {
+            segments.push((*name).to_string());
+            break;
+        }
+        match ctx.tree.parent(cur) {
+            Some(p) => {
+                let idx = ctx
+                    .tree
+                    .get(p)?
+                    .children
+                    .iter()
+                    .position(|&c| c == cur)?;
+                segments.push(idx.to_string());
+                cur = p;
+            }
+            None => {
+                let r = ctx.tree.roots().iter().position(|&x| x == cur)?;
+                segments.push(format!("#root{r}"));
+                break;
+            }
+        }
+    }
+    segments.reverse();
+    Some(segments.join("/"))
 }
 
 /// Walk the color bind list. For each slot whose underlying source
@@ -3446,6 +3575,19 @@ impl ApplicationHandler for App {
                 let Some([cx, cy]) = self.input.cursor else {
                     return;
                 };
+                // A node-level wheel handler under the cursor (slider)
+                // consumes the tick before scroll-container routing.
+                let lines = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(lx, ly) => [lx, ly],
+                    winit::event::MouseScrollDelta::PixelDelta(p) => {
+                        let line = 50.0 * self.scale_factor;
+                        [p.x as f32 / line, p.y as f32 / line]
+                    }
+                };
+                if self.fire_wheel(cx, cy, lines) {
+                    self.react();
+                    return;
+                }
                 // Convert winit's delta to pixel scroll-target delta.
                 // Wheel forward (positive y) = scroll content *up* =
                 // target.y decreases, hence the sign flip on both axes.
@@ -4446,6 +4588,35 @@ mod tests {
     use crate::signal::Signal;
     use std::cell::Cell;
     use std::rc::Rc;
+
+    /// Named scrollers are identified by name; anonymous ones by their
+    /// nearest named ancestor + child-index path. Both must be stable so
+    /// `rebuild_scene` can hand offsets to the rebuilt tree.
+    #[test]
+    fn scroll_identity_names_and_structural_paths() {
+        let mut ctx = SceneCtx::new();
+        {
+            let mut scene = Scene::root(&mut ctx);
+            scene.col("root").child(|p| {
+                p.col("named_scroll").h(Len::Px(50.0)).scroll_y();
+                p.col(()).child(|q| {
+                    q.rect(());
+                    q.col(()).h(Len::Px(50.0)).scroll_y();
+                });
+            });
+        }
+        let named_id = ctx.node("named_scroll").unwrap();
+        assert_eq!(scroll_identity(&ctx, named_id).as_deref(), Some("named_scroll"));
+        let anon = ctx
+            .tree
+            .scrollables()
+            .iter()
+            .copied()
+            .find(|&i| i != named_id)
+            .expect("anonymous scroller registered");
+        // Anchored at the named root: child 1 of root, child 1 within.
+        assert_eq!(scroll_identity(&ctx, anon).as_deref(), Some("root/1/1"));
+    }
 
     #[test]
     fn collect_live_image_handles_finds_every_image_node() {

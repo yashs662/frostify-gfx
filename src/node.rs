@@ -818,6 +818,10 @@ pub struct Node {
     /// **un-pressed** cursor is over this node (the hover analogue of
     /// `on_drag`). Drives hover previews. See [`crate::event::HoverCtx`].
     pub on_hover_move: Option<crate::event::HoverHandler>,
+    /// Wheel callback. A wheel tick over this node fires it INSTEAD of
+    /// scroll-container routing (sliders adjust without scrolling the
+    /// page underneath). See [`crate::event::WheelCtx`].
+    pub on_wheel: Option<crate::event::WheelHandler>,
     /// Drag-end callback. Fires once when a press captured on this node is
     /// released — **regardless of where the cursor ended up** (unlike
     /// `on_click`, which needs release-inside). Completes the slider/scrub
@@ -918,6 +922,7 @@ impl Node {
                 dismiss_transparent: false,
                 on_drag: None,
                 on_hover_move: None,
+                on_wheel: None,
                 on_drag_end: None,
                 drag_payload: None,
                 on_drop: None,
@@ -1363,6 +1368,16 @@ impl NodeBuilder {
         F: for<'a> Fn(&mut crate::event::HoverCtx<'a>) + 'static,
     {
         self.node.on_hover_move = Some(std::rc::Rc::new(f));
+        self
+    }
+
+    /// Install a wheel callback — a wheel tick over this node fires it and
+    /// consumes the event (no scroll routing). See [`crate::event::WheelCtx`].
+    pub fn on_wheel<F>(mut self, f: F) -> Self
+    where
+        F: for<'a> Fn(&mut crate::event::WheelCtx<'a>) + 'static,
+    {
+        self.node.on_wheel = Some(std::rc::Rc::new(f));
         self
     }
 
@@ -2380,6 +2395,37 @@ impl NodeTree {
     /// pull the thumb past either end. The drag-end handler is
     /// responsible for retargeting to a clamped position so the spring
     /// bounces back. Without overscroll, hard-clamps to `[0, max_off]`.
+    /// Quietly restore a scroll position (both axes) — used by
+    /// `rebuild_scene` to carry named scrollers across a rebuild. Clamps
+    /// to the freshly-laid-out range like [`Self::set_scroll_immediate`],
+    /// but doesn't wake the scrollbar (`bar_alpha`) or reset the settle
+    /// timer: a rebuild restore isn't user input, so nothing flashes.
+    pub fn restore_scroll(&mut self, id: NodeId, offset: [f32; 2]) {
+        let (rect, content) = match self.get(id) {
+            Some(n) => (n.rect, n.content_size),
+            None => return,
+        };
+        let mask = self.scroll_mask();
+        if let Some(n) = self.get_mut_raw(id)
+            && let Some(s) = n.scroll.as_mut()
+        {
+            let mut changed = false;
+            for i in 0..2 {
+                let max_off = (content[i] - rect[2 + i]).max(0.0);
+                let p = offset[i].clamp(0.0, max_off);
+                if (s.current[i] - p).abs() > f32::EPSILON || (s.target[i] - p).abs() > f32::EPSILON
+                {
+                    s.current[i] = p;
+                    s.target[i] = p;
+                    changed = true;
+                }
+            }
+            if changed {
+                self.dirty |= mask;
+            }
+        }
+    }
+
     pub fn set_scroll_immediate(&mut self, id: NodeId, axis: ScrollAxis, pos: f32) {
         let (rect, content) = match self.get(id) {
             Some(n) => (n.rect, n.content_size),
@@ -2944,6 +2990,7 @@ impl NodeTree {
             || node.on_hover_dwell.is_some()
             || node.dismiss_transparent
             || node.on_drag.is_some()
+            || node.on_wheel.is_some()
             || node.drag_payload.is_some()
             || node.on_drop.is_some()
             || node.drag_follow

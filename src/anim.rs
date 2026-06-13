@@ -213,6 +213,11 @@ pub struct Tween<T: Lerp> {
     pub curve: Curve,
     pub start: Instant,
     pub duration: Duration,
+    /// Loop forever, reversing direction each time an end is reached
+    /// (skeleton pulses, recording dots). Never self-completes — stop it
+    /// with [`Timeline::stop`]/[`Timeline::stop_for`] or by starting a
+    /// normal tween on the same key/signal.
+    pub pingpong: bool,
 }
 
 impl<T: Lerp> Tween<T> {
@@ -239,6 +244,14 @@ impl<T: Lerp> TweenDyn for Tween<T> {
     }
     fn step(&mut self, now: Instant) -> (bool, bool) {
         let (val, done) = self.sample(now);
+        if done && self.pingpong {
+            // Land exactly on the end value, then turn around for the
+            // next leg. Reports not-done so the timeline keeps it alive.
+            let updated = self.signal.set(self.to);
+            std::mem::swap(&mut self.from, &mut self.to);
+            self.start = now;
+            return (updated, false);
+        }
         let final_val = if done { self.to } else { val };
         let updated = self.signal.set(final_val);
         (updated, done)
@@ -327,6 +340,7 @@ impl Timeline {
             curve,
             start: now,
             duration,
+            pingpong: false,
         }));
     }
 
@@ -355,6 +369,35 @@ impl Timeline {
     /// counterpart to [`Self::animate`].
     pub fn stop_for<T: Lerp>(&mut self, signal: &Signal<T>) {
         self.stop(signal_tween_key(signal.id()));
+    }
+
+    /// Endlessly oscillate `signal` between `from` and `to` (one leg =
+    /// `duration`, then reverse) — skeleton pulses and the like. Snaps to
+    /// `from` first so every pulse starts from the same phase. Identity-
+    /// keyed like [`Self::animate`]: a later `animate`/`stop_for` on the
+    /// same signal replaces/stops it.
+    pub fn animate_pingpong<T: Lerp>(
+        &mut self,
+        signal: &Signal<T>,
+        from: T,
+        to: T,
+        curve: Curve,
+        duration: Duration,
+        now: Instant,
+    ) {
+        let key = signal_tween_key(signal.id());
+        self.tweens.retain(|t| t.key() != key);
+        signal.set(from);
+        self.tweens.push(Box::new(Tween {
+            key,
+            signal: signal.clone(),
+            from,
+            to,
+            curve,
+            start: now,
+            duration,
+            pingpong: true,
+        }));
     }
 
     pub fn clear(&mut self) {
@@ -416,6 +459,27 @@ mod tests {
         assert!(end.updated);
         assert!(!tl.active());
         assert_eq!(s.get(), 1.0);
+    }
+
+    #[test]
+    fn pingpong_reverses_and_never_completes() {
+        let s = Signal::new(1.0f32);
+        let mut tl = Timeline::new();
+        let now = Instant::now();
+        tl.animate_pingpong(&s, 1.0, 0.4, Curve::Linear, Duration::from_millis(100), now);
+        // Forward leg: 1.0 → 0.4.
+        tl.tick(now + Duration::from_millis(50));
+        assert!((s.get() - 0.7).abs() < 1e-3);
+        // End of leg: lands on 0.4, stays alive, reverses.
+        tl.tick(now + Duration::from_millis(100));
+        assert_eq!(s.get(), 0.4);
+        assert!(tl.active(), "pingpong must not self-complete");
+        // Return leg heads back toward 1.0.
+        tl.tick(now + Duration::from_millis(150));
+        assert!((s.get() - 0.7).abs() < 1e-3);
+        // stop_for kills it (identity-keyed).
+        tl.stop_for(&s);
+        assert!(!tl.active());
     }
 
     #[test]

@@ -1806,6 +1806,20 @@ impl<'a> NodeBuilderRef<'a> {
         self
     }
 
+    /// Wheel callback — a wheel tick over this node fires it and consumes
+    /// the event (no scroll-container routing), so a slider adjusts
+    /// without scrolling the page underneath. See [`crate::event::WheelCtx`].
+    pub fn on_wheel<F>(&mut self, f: F) -> &mut Self
+    where
+        F: for<'h> Fn(&mut crate::event::WheelCtx<'h>) + 'static,
+    {
+        let handler: crate::event::WheelHandler = std::rc::Rc::new(f);
+        if let Some(n) = self.ctx.tree.get_mut_raw(self.id) {
+            n.on_wheel = Some(handler);
+        }
+        self
+    }
+
     /// Drag-end callback — fires once when a press captured on this node
     /// releases, regardless of cursor position. Pairs with
     /// [`Self::on_drag`] for commit-on-release sliders.
