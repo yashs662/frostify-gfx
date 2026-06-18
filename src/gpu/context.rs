@@ -140,7 +140,19 @@ impl GpuContext {
     }
 
     async fn new_async(window: Arc<Window>) -> Self {
-        let instance = wgpu::Instance::default();
+        // Primary backends only (DX12 / Vulkan / Metal) — skips the GL/ANGLE
+        // probe that `Backends::all()` adds for a backend we never pick. On
+        // Windows wgpu picks Vulkan, whose pipeline creation reuses cached
+        // SPIR-V (the DX12 path recompiles HLSL via FXC, far slower to cold
+        // start). `WGPU_BACKEND` still overrides (e.g. a Vulkan-less box can
+        // force `dx12`).
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::from_env().unwrap_or(wgpu::Backends::PRIMARY),
+            flags: wgpu::InstanceFlags::from_build_config(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            backend_options: wgpu::BackendOptions::from_env_or_default(),
+            display: None,
+        });
         let surface = instance
             .create_surface(Arc::clone(&window))
             .expect("create surface");
@@ -439,16 +451,23 @@ impl GpuContext {
     }
 
     /// Move a resident frame set from `old` to `new` (a rebuild reassigned
-    /// the `.external()` node id). No re-upload; rebinds the shown texture to
-    /// the migrated set's last frame (the next `select` corrects the index).
+    /// the `.external()` node id). No re-upload; carries the *currently
+    /// shown* frame across so the migrated node keeps displaying the exact
+    /// frame it was on — binding the clip's last frame instead made the
+    /// video snap to the end of its loop for one tick on every rebuild (a
+    /// visible hitch). Falls back to the last frame only if nothing was
+    /// bound yet.
     pub fn migrate_external_frames(&mut self, old: crate::node::NodeId, new: crate::node::NodeId) {
         if old == new {
             return;
         }
         if let Some(set) = self.external_frame_sets.remove(&old) {
-            self.external_textures.remove(&old);
-            if let Some(view) = set.views.last() {
-                self.external_textures.insert(new, view.clone());
+            let shown = self
+                .external_textures
+                .remove(&old)
+                .or_else(|| set.views.last().cloned());
+            if let Some(view) = shown {
+                self.external_textures.insert(new, view);
             }
             self.external_frame_sets.insert(new, set);
         }

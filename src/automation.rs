@@ -37,6 +37,9 @@ pub enum Step {
     /// Move to `[x, y]`, then press + release left button (fires
     /// `on_click` on the node under the cursor).
     Click([f32; 2]),
+    /// Move to `[x, y]`, then press + release the right button (fires
+    /// `on_right_click` — opens context menus).
+    RightClick([f32; 2]),
     /// Move to `[x, y]` and dwell there for `Duration` (so hover tints +
     /// hover-dwell tooltips fire). Scheduling-only; the dwell pump runs
     /// during the wait.

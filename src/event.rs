@@ -27,6 +27,11 @@ pub struct EventCtx<'a> {
     pub timeline: &'a mut crate::anim::Timeline,
     pub node: NodeId,
     pub now: Instant,
+    /// Cursor position (physical px) at the time the event fired — the
+    /// click/right-click location. `[0, 0]` if no pointer position is
+    /// known (e.g. a keyboard-triggered activation). Lets a handler
+    /// anchor a popup (context menu) at the cursor.
+    pub cursor: [f32; 2],
 }
 
 /// A node-bound event callback. Refcounted so the same closure can be
@@ -99,6 +104,11 @@ pub type HoverHandler = Rc<dyn for<'a> Fn(&mut HoverCtx<'a>) + 'static>;
 /// `[x, y, w, h]` (physical px).
 pub struct WheelCtx<'a> {
     pub tree: &'a mut NodeTree,
+    /// Timeline + `now`, so a wheel handler can animate a signal in
+    /// response (e.g. a volume slider easing to its new step) rather than
+    /// snapping. Mirrors [`EventCtx`].
+    pub timeline: &'a mut crate::anim::Timeline,
+    pub now: std::time::Instant,
     pub node: NodeId,
     pub delta: [f32; 2],
     pub rect: [f32; 4],
@@ -148,6 +158,7 @@ mod tests {
             timeline: &mut timeline,
             node: id,
             now: std::time::Instant::now(),
+            cursor: [0.0, 0.0],
         };
         h2(&mut ectx);
         h2(&mut ectx);
@@ -170,6 +181,7 @@ mod tests {
             timeline: &mut timeline,
             node: id,
             now: std::time::Instant::now(),
+            cursor: [0.0, 0.0],
         };
         h(&mut ectx);
         assert_eq!(tree.get(id).unwrap().style.color, [1.0, 0.0, 0.0, 1.0]);

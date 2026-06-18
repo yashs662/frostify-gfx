@@ -183,8 +183,10 @@ impl InputState {
     pub fn cancel(&mut self, hits: &[HitEntry], tree: &NodeTree) -> InputChange {
         self.captured = None;
         self.cursor = None;
-        let mut change = InputChange::default();
-        change.pressed_changed = sync_bool_signals(hits, tree, None, |n| &n.interact.pressed);
+        let mut change = InputChange {
+            pressed_changed: sync_bool_signals(hits, tree, None, |n| &n.interact.pressed),
+            ..Default::default()
+        };
         if self.hovered.is_some() {
             self.hovered = None;
             change.hovered_changed = sync_bool_signals(hits, tree, None, |n| &n.interact.hover);

@@ -1026,6 +1026,7 @@ impl App {
         }
     }
 
+
     /// Build a numeric-label HUD from the most recent frame stats and
     /// upload it as overlay instances. Cleared when `hud_enabled` flips
     /// off. Throttled to ~10 Hz: cpu/gpu_ms jitter would otherwise
@@ -1363,6 +1364,7 @@ impl App {
             timeline: &mut self.timeline,
             node: tracker.node,
             now,
+            cursor: self.input.cursor.unwrap_or([0.0, 0.0]),
         };
         h(&mut ectx);
         true
@@ -1440,6 +1442,7 @@ impl App {
                 timeline: &mut self.timeline,
                 node: node_id,
                 now: Instant::now(),
+                cursor: self.input.cursor.unwrap_or([0.0, 0.0]),
             };
             h(&mut ectx);
         }
@@ -1927,6 +1930,8 @@ impl App {
         let scale = self.scale_factor;
         let mut wctx = crate::event::WheelCtx {
             tree: &mut self.ctx.tree,
+            timeline: &mut self.timeline,
+            now: std::time::Instant::now(),
             node,
             delta,
             rect,
@@ -1951,6 +1956,7 @@ impl App {
                 timeline: &mut self.timeline,
                 node: dn,
                 now: Instant::now(),
+                cursor: self.input.cursor.unwrap_or([0.0, 0.0]),
             };
             h(&mut ectx);
         }
@@ -2069,6 +2075,7 @@ impl App {
                 timeline: &mut self.timeline,
                 node: dn,
                 now: Instant::now(),
+                cursor: self.input.cursor.unwrap_or([0.0, 0.0]),
             };
             h(&mut ectx);
         }
@@ -2168,6 +2175,20 @@ impl App {
                     .flatten()
             })
             .collect();
+        // 0b. Snapshot every `.external()` node's identity → current id. An
+        //    external node (Canvas video) gets a fresh NodeId each rebuild;
+        //    its GPU resident frame set is keyed by that id, so without
+        //    carrying it across the new (empty) node paints one blank frame —
+        //    a visible canvas flicker on every view change / modal toggle.
+        //    Same identity scheme as the scroll snapshot above; restored by
+        //    migrating the frame set onto the reincarnated id before flush.
+        let saved_external: Vec<(String, crate::node::NodeId)> = self
+            .ctx
+            .tree
+            .iter_ids()
+            .filter(|&id| self.ctx.tree.get(id).map(|n| n.external).unwrap_or(false))
+            .filter_map(|id| scroll_identity(&self.ctx, id).map(|key| (key, id)))
+            .collect();
         // 1. Snapshot the root list, then drop each subtree. Iterating
         //    `tree.roots()` directly while removing would alias the
         //    same Vec.
@@ -2207,6 +2228,31 @@ impl App {
             builder(&mut scene);
         }
         self.scene_builder = Some(builder);
+        // 3b. Carry resident external-frame sets (Canvas video) onto their
+        //     reincarnated node ids, synchronously here — BEFORE flush/render
+        //     so the rebuilt external node samples its video on the very
+        //     first paint instead of flashing empty. A later, stale `migrate`
+        //     from the decode thread (it still holds the old id until the
+        //     next `sync_node`) lands as a harmless no-op (set already moved).
+        if !saved_external.is_empty() {
+            let saved: std::collections::HashMap<String, crate::node::NodeId> =
+                saved_external.into_iter().collect();
+            let pairs: Vec<(crate::node::NodeId, crate::node::NodeId)> = self
+                .ctx
+                .tree
+                .iter_ids()
+                .filter(|&id| self.ctx.tree.get(id).map(|n| n.external).unwrap_or(false))
+                .filter_map(|id| {
+                    let key = scroll_identity(&self.ctx, id)?;
+                    saved.get(&key).map(|&old| (old, id))
+                })
+                .collect();
+            if let Some(gpu) = self.gpu.as_mut() {
+                for (old, new) in pairs {
+                    gpu.migrate_external_frames(old, new);
+                }
+            }
+        }
         // 4. Flush + redraw. flush_tree returns true if anything
         //    changed; rebuild always changes everything.
         if self.flush_tree() {
@@ -2251,7 +2297,17 @@ impl App {
                 &self.scroll_bars,
                 &mut self.ctx.tree,
             );
-            let _change = self.input.on_cursor_moved(x, y, &self.hits, &self.ctx.tree);
+            let change = self.input.on_cursor_moved(x, y, &self.hits, &self.ctx.tree);
+            // Re-deriving hover set the hovered node's signal, dirtying the
+            // tree AFTER the flush above — so the just-flattened instances
+            // still show that node un-hovered. Re-flush now so the restored
+            // hover lands in the instance buffer before the next paint.
+            // Without this, a 60 fps external (Canvas) `render_once` paints
+            // the one un-hovered frame, reading as a hover flicker on every
+            // rebuild (the canvas makes the otherwise-invisible gap visible).
+            if change.any() && self.flush_tree() {
+                self.request_redraw();
+            }
         }
     }
 
@@ -3716,6 +3772,7 @@ impl ApplicationHandler for App {
                             timeline: &mut self.timeline,
                             node: target,
                             now: Instant::now(),
+                            cursor: self.input.cursor.unwrap_or([0.0, 0.0]),
                         };
                         h(&mut ectx);
                     }
@@ -3749,6 +3806,7 @@ impl ApplicationHandler for App {
                             timeline: &mut self.timeline,
                             node: target,
                             now: Instant::now(),
+                            cursor: self.input.cursor.unwrap_or([0.0, 0.0]),
                         };
                         h(&mut ectx);
                     }
@@ -4285,6 +4343,12 @@ impl App {
                     self.inject_left(false);
                     state.advance_now(now);
                 }
+                Step::RightClick(p) => {
+                    self.inject_cursor_moved(p[0], p[1]);
+                    self.inject_right(true);
+                    self.inject_right(false);
+                    state.advance_now(now);
+                }
                 Step::Scroll(p, d) => {
                     self.inject_cursor_moved(p[0], p[1]);
                     self.inject_wheel(d[0], d[1]);
@@ -4354,12 +4418,43 @@ impl App {
                     timeline: &mut self.timeline,
                     node: target,
                     now: Instant::now(),
+                    cursor: self.input.cursor.unwrap_or([0.0, 0.0]),
                 };
                 h(&mut ectx);
             }
         }
         // A nav/click handler may have flipped the rebuild token — apply
         // it now so the new view is live before the next step/screenshot.
+        if self.rebuild_request.replace(false) {
+            self.rebuild_scene();
+        }
+        if change.any() {
+            self.react();
+        }
+    }
+
+    /// Scripted right-click — mirror of the `MouseButton::Right`
+    /// WindowEvent path: fire `on_right_click` on the target + apply any
+    /// rebuild it requested (so a context menu is live for the next step).
+    fn inject_right(&mut self, pressed: bool) {
+        let change = if pressed {
+            self.input.on_right_pressed(&self.hits, &self.ctx.tree)
+        } else {
+            self.input.on_right_released(&self.hits, &self.ctx.tree)
+        };
+        if let Some(target) = change.right_click_target {
+            let handler = self.ctx.tree.get(target).and_then(|n| n.on_right_click.clone());
+            if let Some(h) = handler {
+                let mut ectx = crate::event::EventCtx {
+                    tree: &mut self.ctx.tree,
+                    timeline: &mut self.timeline,
+                    node: target,
+                    now: Instant::now(),
+                    cursor: self.input.cursor.unwrap_or([0.0, 0.0]),
+                };
+                h(&mut ectx);
+            }
+        }
         if self.rebuild_request.replace(false) {
             self.rebuild_scene();
         }
