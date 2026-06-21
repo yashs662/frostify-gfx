@@ -6,7 +6,7 @@
 //! Run with:
 //!     cargo run --example glass_grid
 
-use frostify_gfx::{App, ImageHandle, Len, Scene};
+use opal_gfx::{App, ImageHandle, Len, Scene};
 
 const W: u32 = 1000;
 const H: u32 = 720;
@@ -117,10 +117,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .init();
 
-    let mut app = App::new("frostify-gfx — glass grid", W, H);
+    let mut app = App::new("opal-gfx — glass grid", W, H);
     let (iw, ih, bytes) = make_checker_image();
     let art = app.stage_image_rgba(iw, ih, bytes);
-    // `FROSTIFY_AUTOCAPTURE=1` writes one frame to `debug_captures/` and
+    // `OPAL_AUTOCAPTURE=1` writes one frame to `debug_captures/` and
     // exits — the deterministic root-layer-parity capture gate. Without
     // it the example runs interactively for eyeballing glass params.
     let app = app.scene(move |s| build_scene(s, art)).capture_from_env();

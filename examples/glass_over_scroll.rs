@@ -10,7 +10,7 @@
 //!
 //!     cargo run --example glass_over_scroll
 
-use frostify_gfx::{App, Len, Scene};
+use opal_gfx::{App, Len, Scene};
 
 const W: u32 = 600;
 const H: u32 = 400;
@@ -81,7 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .init();
 
-    let app = App::new("frostify-gfx — glass over scroll", W, H)
+    let app = App::new("opal-gfx — glass over scroll", W, H)
         .scene(build_scene)
         .headless(|h| {
             let list = h.ctx.node("list").expect("list node");

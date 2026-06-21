@@ -14,7 +14,7 @@
 mod common;
 
 use common::components::{modal, ModalProps};
-use frostify_gfx::{App, Align, Scene, Signal};
+use opal_gfx::{App, Align, Scene, Signal};
 
 const W: u32 = 640;
 const H: u32 = 480;

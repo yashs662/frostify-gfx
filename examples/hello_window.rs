@@ -1,4 +1,4 @@
-//! frostify-gfx demo — declarative flex scene + reactive bindings,
+//! opal-gfx demo — declarative flex scene + reactive bindings,
 //! with a z-order playground showing painter's-order layering across
 //! all node kinds (rect / glass / text / image).
 //!
@@ -40,7 +40,7 @@ mod common;
 use std::env;
 use std::time::{Duration, Instant};
 
-use frostify_gfx::{App, HeadlessHelper, ImageHandle, Len, Scene, Signal, WindowAction};
+use opal_gfx::{App, HeadlessHelper, ImageHandle, Len, Scene, Signal, WindowAction};
 use winit::event::ElementState;
 use winit::keyboard::KeyCode;
 
@@ -99,7 +99,7 @@ fn build_scene(s: &mut Scene, sigs: &Sigs, art: ImageHandle) {
             title_bar(
                 p,
                 TitleBarProps {
-                    title: "frostify-gfx demo".into(),
+                    title: "opal-gfx demo".into(),
                     dots: vec![
                         DotProps {
                             color: DOTS[0],
@@ -215,7 +215,7 @@ fn build_scene(s: &mut Scene, sigs: &Sigs, art: ImageHandle) {
 }
 
 fn run_headless(h: &mut HeadlessHelper, sigs: Sigs) {
-    if env::var_os("FROSTIFY_AUTOCAPTURE_HIT").is_some() {
+    if env::var_os("OPAL_AUTOCAPTURE_HIT").is_some() {
         // Hit the hero rect after layout places it.
         let (cx, cy) = match h.ctx.node("hero").and_then(|id| h.ctx.tree.get(id)) {
             Some(n) => (n.rect[0] + n.rect[2] * 0.5, n.rect[1] + n.rect[3] * 0.5),
@@ -239,7 +239,7 @@ fn run_headless(h: &mut HeadlessHelper, sigs: Sigs) {
         h.react(Instant::now());
         h.settle();
     }
-    if env::var_os("FROSTIFY_AUTOCAPTURE_GLASS").is_some() {
+    if env::var_os("OPAL_AUTOCAPTURE_GLASS").is_some() {
         let cur = sigs.blob_pos.get();
         sigs.blob_pos.set([cur[0] + 120.0, cur[1]]);
         h.react(Instant::now());
@@ -248,7 +248,7 @@ fn run_headless(h: &mut HeadlessHelper, sigs: Sigs) {
         h.render();
         h.capture();
     }
-    if env::var_os("FROSTIFY_AUTOCAPTURE_ANIM").is_some() {
+    if env::var_os("OPAL_AUTOCAPTURE_ANIM").is_some() {
         sigs.hover.set(true);
         h.react(Instant::now());
         let t0 = Instant::now();
@@ -263,7 +263,7 @@ fn run_headless(h: &mut HeadlessHelper, sigs: Sigs) {
             h.capture();
         }
     }
-    if env::var_os("FROSTIFY_AUTOCAPTURE_TOGGLE").is_some() {
+    if env::var_os("OPAL_AUTOCAPTURE_TOGGLE").is_some() {
         sigs.lit.set(true);
         h.react(Instant::now());
         h.settle();
@@ -271,14 +271,14 @@ fn run_headless(h: &mut HeadlessHelper, sigs: Sigs) {
         h.render();
         h.capture();
     }
-    if env::var_os("FROSTIFY_AUTOCAPTURE_OVERDRAW").is_some() {
+    if env::var_os("OPAL_AUTOCAPTURE_OVERDRAW").is_some() {
         h.gpu.set_overdraw(true);
         h.flush();
         h.render();
         h.capture();
         h.gpu.set_overdraw(false);
     }
-    if env::var_os("FROSTIFY_AUTOCAPTURE_HUD").is_some() {
+    if env::var_os("OPAL_AUTOCAPTURE_HUD").is_some() {
         h.show_hud();
         h.render();
         h.capture();
@@ -320,7 +320,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scene_sigs = sigs.clone();
     let key_sigs = sigs.clone();
 
-    let mut app = App::new("frostify-gfx", W, H);
+    let mut app = App::new("opal-gfx", W, H);
     let (img_w, img_h, img_bytes) = make_demo_image();
     let art = app.stage_image_rgba(img_w, img_h, img_bytes);
     let mut app = app
@@ -355,7 +355,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    if env::var_os("FROSTIFY_AUTOCAPTURE").is_some() {
+    if env::var_os("OPAL_AUTOCAPTURE").is_some() {
         let hsigs = sigs.clone();
         app = app.headless(move |h| run_headless(h, hsigs));
     }

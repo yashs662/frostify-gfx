@@ -37,7 +37,7 @@ impl WindowRound {
     ) -> Self {
         let (frame_tex, frame_view) = make_frame_tex(device, width, height, surface_format);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("frostify.window_round sampler"),
+            label: Some("opal.window_round sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
@@ -47,18 +47,18 @@ impl WindowRound {
             ..Default::default()
         });
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("frostify.window_round uniform"),
+            label: Some("opal.window_round uniform"),
             size: std::mem::size_of::<RoundU>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("frostify.window_round shader"),
+            label: Some("opal.window_round shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/window_round.wgsl").into()),
         });
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("frostify.window_round bgl"),
+            label: Some("opal.window_round bgl"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -89,12 +89,12 @@ impl WindowRound {
             ],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("frostify.window_round pl"),
+            label: Some("opal.window_round pl"),
             bind_group_layouts: &[Some(&bgl)],
             immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("frostify.window_round"),
+            label: Some("opal.window_round"),
             layout: Some(&layout),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -192,7 +192,7 @@ fn make_frame_tex(
     format: wgpu::TextureFormat,
 ) -> (wgpu::Texture, wgpu::TextureView) {
     let tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("frostify.window_round.frame"),
+        label: Some("opal.window_round.frame"),
         size: wgpu::Extent3d {
             width: width.max(1),
             height: height.max(1),
@@ -217,7 +217,7 @@ fn make_bg(
     uniform: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("frostify.window_round bg"),
+        label: Some("opal.window_round bg"),
         layout,
         entries: &[
             wgpu::BindGroupEntry {

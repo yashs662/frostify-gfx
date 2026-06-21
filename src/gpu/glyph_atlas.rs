@@ -47,7 +47,7 @@ pub struct GlyphAtlas {
 impl GlyphAtlas {
     pub fn new(device: &wgpu::Device, size: u32) -> Self {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("frostify-gfx glyph atlas"),
+            label: Some("opal-gfx glyph atlas"),
             size: wgpu::Extent3d {
                 width: size,
                 height: size,
@@ -62,7 +62,7 @@ impl GlyphAtlas {
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("frostify-gfx glyph sampler"),
+            label: Some("opal-gfx glyph sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
@@ -72,7 +72,7 @@ impl GlyphAtlas {
             ..Default::default()
         });
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("frostify-gfx glyph atlas bgl"),
+            label: Some("opal-gfx glyph atlas bgl"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -93,7 +93,7 @@ impl GlyphAtlas {
             ],
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("frostify-gfx glyph atlas bg"),
+            label: Some("opal-gfx glyph atlas bg"),
             layout: &layout,
             entries: &[
                 wgpu::BindGroupEntry {

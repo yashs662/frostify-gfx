@@ -17,7 +17,7 @@
 mod common;
 
 use common::components::{slider, SliderProps};
-use frostify_gfx::{App, Align, Len, Scene, Signal};
+use opal_gfx::{App, Align, Len, Scene, Signal};
 
 const W: u32 = 640;
 const H: u32 = 460;

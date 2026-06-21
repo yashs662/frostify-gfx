@@ -18,7 +18,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
-use frostify_gfx::{App, BarSide, Curve, Justify, Len, NodeId, Scene, Signal};
+use opal_gfx::{App, BarSide, Curve, Justify, Len, NodeId, Scene, Signal};
 
 use common::image::hsv;
 
@@ -44,7 +44,7 @@ struct AnimSlot {
 /// Locate the lazy-list node in the tree. There's only one in this
 /// demo; for multi-list scenes the caller would store its id at
 /// scene-build time instead of walking.
-fn find_list(ctx: &frostify_gfx::SceneCtx) -> Option<NodeId> {
+fn find_list(ctx: &opal_gfx::SceneCtx) -> Option<NodeId> {
     ctx.tree.iter_ids().find(|id| {
         ctx.tree
             .get(*id)
@@ -153,7 +153,7 @@ fn build(
 
 /// `EventCtx` only exposes `&mut NodeTree`, not the wider `SceneCtx`.
 /// Walking the tree for the unique lazy-list works fine.
-fn find_list_via_ctx(tree: &frostify_gfx::NodeTree) -> Option<NodeId> {
+fn find_list_via_ctx(tree: &opal_gfx::NodeTree) -> Option<NodeId> {
     tree.iter_ids().find(|id| {
         tree.get(*id)
             .map(|n| n.lazy_list.is_some())

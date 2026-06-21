@@ -79,7 +79,7 @@ struct ImageSource {
 impl ImageAtlas {
     pub fn new(device: &wgpu::Device, size: u32) -> Self {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("frostify-gfx image atlas"),
+            label: Some("opal-gfx image atlas"),
             size: wgpu::Extent3d {
                 width: size,
                 height: size,
@@ -94,7 +94,7 @@ impl ImageAtlas {
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("frostify-gfx image sampler"),
+            label: Some("opal-gfx image sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
@@ -104,7 +104,7 @@ impl ImageAtlas {
             ..Default::default()
         });
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("frostify-gfx image atlas bgl"),
+            label: Some("opal-gfx image atlas bgl"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -125,7 +125,7 @@ impl ImageAtlas {
             ],
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("frostify-gfx image atlas bg"),
+            label: Some("opal-gfx image atlas bg"),
             layout: &layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -322,7 +322,7 @@ impl ImageAtlas {
             return false;
         }
         let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("frostify-gfx image atlas"),
+            label: Some("opal-gfx image atlas"),
             size: wgpu::Extent3d {
                 width: new_size,
                 height: new_size,
@@ -339,7 +339,7 @@ impl ImageAtlas {
         // Sampler params don't depend on size; cheaper to recreate than
         // to thread a stored sampler through the struct.
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("frostify-gfx image sampler"),
+            label: Some("opal-gfx image sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
@@ -349,7 +349,7 @@ impl ImageAtlas {
             ..Default::default()
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("frostify-gfx image atlas bg"),
+            label: Some("opal-gfx image atlas bg"),
             layout: &self.layout,
             entries: &[
                 wgpu::BindGroupEntry {

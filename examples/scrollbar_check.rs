@@ -5,7 +5,7 @@
 //! Run with:
 //!     cargo run --example scrollbar_check
 
-use frostify_gfx::{App, Justify, Len, Scene};
+use opal_gfx::{App, Justify, Len, Scene};
 
 const W: u32 = 540;
 const H: u32 = 540;

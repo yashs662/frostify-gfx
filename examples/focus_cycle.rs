@@ -12,7 +12,7 @@
 //! Run with:
 //!     cargo run --example focus_cycle
 
-use frostify_gfx::{App, Computed, Len, Scene, Signal, deps};
+use opal_gfx::{App, Computed, Len, Scene, Signal, deps};
 
 const W: u32 = 520;
 const H: u32 = 460;

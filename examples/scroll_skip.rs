@@ -10,7 +10,7 @@
 //!
 //!     cargo run --example scroll_skip
 
-use frostify_gfx::{App, Len, Scene};
+use opal_gfx::{App, Len, Scene};
 
 const W: u32 = 500;
 const H: u32 = 600;
@@ -49,7 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .init();
 
-    let app = App::new("frostify-gfx — scroll skip", W, H)
+    let app = App::new("opal-gfx — scroll skip", W, H)
         .scene(build_scene)
         .headless(|h| {
             // `resumed` already flushed + rendered once (every layer
@@ -104,7 +104,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // by whole-row snap; at scroll≈300 the top visible row is ~7.
             // `hits` were rebuilt by `flush`; pick the topmost at that point.
             let scroll_y = h.ctx.tree.get(list).and_then(|n| n.scroll.as_ref()).map(|s| s.current[1]).unwrap_or(0.0);
-            let hit = frostify_gfx::InputState::hit_test(h.hits, 12.0, 10.0);
+            let hit = opal_gfx::InputState::hit_test(h.hits, 12.0, 10.0);
             // Recover the row index by matching the hit id against named rows.
             let hit_name =
                 hit.and_then(|id| (0..ROWS).find(|i| h.ctx.node(&format!("row{i}")) == Some(id)));

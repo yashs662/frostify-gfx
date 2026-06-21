@@ -1,4 +1,4 @@
-//! Shared scaffolding for the frostify-gfx examples.
+//! Shared scaffolding for the opal-gfx examples.
 //!
 //! Cargo auto-discovers examples at `examples/<name>.rs` (files) or
 //! `examples/<name>/main.rs` (subdirs with `main.rs`). A subdir without

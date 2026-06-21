@@ -3546,7 +3546,7 @@ fn bar_quad(
 /// scroll = raster 0.
 ///
 /// `node_id` keys the span. The scroll-content layer keys by the same id,
-/// but they never collide: Frostify scroll layers re-flatten every scroll
+/// but they never collide: Opal scroll layers re-flatten every scroll
 /// (no `LayerTree::set_offset` call that would patch a layer by node id),
 /// and `LayerTree::rebuild` emits one [`crate::layer::Layer`] per span
 /// regardless of id.

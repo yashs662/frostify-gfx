@@ -48,7 +48,7 @@ impl OverdrawResources {
         let (count_tex, count_view) = make_count_tex(device, width, height);
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("frostify.overdraw sampler"),
+            label: Some("opal.overdraw sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
@@ -61,12 +61,12 @@ impl OverdrawResources {
         // Count pipeline shares the shape bind group layout (frame +
         // instance buffer). It samples nothing, so no group 1.
         let count_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("frostify.overdraw shader"),
+            label: Some("opal.overdraw shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/overdraw.wgsl").into()),
         });
 
         let count_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("frostify.overdraw.count pl"),
+            label: Some("opal.overdraw.count pl"),
             bind_group_layouts: &[Some(shape_bgl)],
             immediate_size: 0,
         });
@@ -85,7 +85,7 @@ impl OverdrawResources {
         });
 
         let count_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("frostify.overdraw.count"),
+            label: Some("opal.overdraw.count"),
             layout: Some(&count_layout),
             vertex: wgpu::VertexState {
                 module: &count_shader,
@@ -120,14 +120,14 @@ impl OverdrawResources {
 
         // Compose pipeline: fullscreen quad sampling the count texture.
         let compose_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("frostify.overdraw.compose shader"),
+            label: Some("opal.overdraw.compose shader"),
             source: wgpu::ShaderSource::Wgsl(
                 include_str!("shaders/overdraw_compose.wgsl").into(),
             ),
         });
 
         let compose_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("frostify.overdraw.compose bgl"),
+            label: Some("opal.overdraw.compose bgl"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -149,13 +149,13 @@ impl OverdrawResources {
         });
 
         let compose_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("frostify.overdraw.compose pl"),
+            label: Some("opal.overdraw.compose pl"),
             bind_group_layouts: &[Some(&compose_bgl)],
             immediate_size: 0,
         });
 
         let compose_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("frostify.overdraw.compose"),
+            label: Some("opal.overdraw.compose"),
             layout: Some(&compose_layout),
             vertex: wgpu::VertexState {
                 module: &compose_shader,
@@ -223,7 +223,7 @@ fn make_count_tex(
     height: u32,
 ) -> (wgpu::Texture, wgpu::TextureView) {
     let tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("frostify.overdraw.count"),
+        label: Some("opal.overdraw.count"),
         size: wgpu::Extent3d {
             width: width.max(1),
             height: height.max(1),
@@ -247,7 +247,7 @@ fn make_compose_bg(
     sampler: &wgpu::Sampler,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("frostify.overdraw.compose bg"),
+        label: Some("opal.overdraw.compose bg"),
         layout,
         entries: &[
             wgpu::BindGroupEntry {

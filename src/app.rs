@@ -3,7 +3,7 @@
 //! Use it like:
 //!
 //! ```ignore
-//! frostify_gfx::app::App::new("demo", 1100, 750)
+//! opal_gfx::app::App::new("demo", 1100, 750)
 //!     .scene(|s| build_demo(s))
 //!     .on_key(|code, state, ctx| handle_key(code, state, ctx))
 //!     .run()
@@ -93,6 +93,10 @@ pub struct AppConfig {
     /// when the window is maximised / fullscreen since edge rounding
     /// against the work-area boundary just clips usable pixels.
     pub window_corner_radius: f32,
+    /// Taskbar / alt-tab window icon as `(width, height, rgba8)`. `None`
+    /// (default) leaves winit to fall back to the embedded executable
+    /// icon. Set via [`App::window_icon_rgba`].
+    pub window_icon: Option<(u32, u32, Vec<u8>)>,
 }
 
 impl AppConfig {
@@ -106,6 +110,7 @@ impl AppConfig {
             blur: true,
             capture_dir: PathBuf::from("debug_captures"),
             window_corner_radius: 0.0,
+            window_icon: None,
         }
     }
 }
@@ -303,7 +308,7 @@ pub struct App {
     /// updates don't allocate a fresh draw-list Vec each frame.
     layer_draw_scratch: Vec<crate::gpu::LayerDraw>,
     /// Stat-dump cadence: continuously log on every render when set.
-    /// Toggled by `FROSTIFY_STATS=1` env var or by F1 in interactive mode.
+    /// Toggled by `OPAL_STATS=1` env var or by F1 in interactive mode.
     stats_log: bool,
     /// Bar-gauge HUD overlay: enabled by F1 (along with stats logging).
     /// Stage-1 has no text renderer, so the HUD is rect-only.
@@ -510,8 +515,8 @@ impl App {
             layer_draw_scratch: Vec::new(),
             last_cpu_ms: 0.0,
             last_render_stats: None,
-            stats_log: std::env::var_os("FROSTIFY_STATS").is_some(),
-            hud_enabled: std::env::var_os("FROSTIFY_HUD").is_some(),
+            stats_log: std::env::var_os("OPAL_STATS").is_some(),
+            hud_enabled: std::env::var_os("OPAL_HUD").is_some(),
             last_cursor_icon: CursorIcon::Default,
             scale_factor: 1.0,
             logical_size: [width, height],
@@ -707,20 +712,20 @@ impl App {
         self
     }
 
-    /// Env-var shim for the legacy `FROSTIFY_AUTOCAPTURE` flag.
+    /// Env-var shim for the legacy `OPAL_AUTOCAPTURE` flag.
     /// Returns `self` unchanged when the variable is not set, so the
     /// call is harmless in normal interactive runs. CI/self-verify
     /// keeps working without code changes; scripted multi-frame flows
     /// still use [`App::headless`] separately.
     ///
-    /// Also honours `FROSTIFY_AUTOCAPTURE_DELAY_MS` (integer ms) — if
+    /// Also honours `OPAL_AUTOCAPTURE_DELAY_MS` (integer ms) — if
     /// set, the autocapture is deferred by that long so async UI state
     /// has time to populate before the snapshot.
     pub fn capture_from_env(mut self) -> Self {
-        if std::env::var_os("FROSTIFY_AUTOCAPTURE").is_some() {
+        if std::env::var_os("OPAL_AUTOCAPTURE").is_some() {
             self = self.capture_once();
         }
-        if let Some(raw) = std::env::var_os("FROSTIFY_AUTOCAPTURE_DELAY_MS")
+        if let Some(raw) = std::env::var_os("OPAL_AUTOCAPTURE_DELAY_MS")
             && let Ok(s) = raw.into_string()
             && let Ok(ms) = s.trim().parse::<u64>()
         {
@@ -757,6 +762,16 @@ impl App {
     /// work-area boundary clips usable pixels for no visual gain.
     pub fn window_corner_radius(mut self, r: f32) -> Self {
         self.config.window_corner_radius = r.max(0.0);
+        self
+    }
+
+    /// Set the taskbar / alt-tab window icon from raw RGBA8 (`w * h * 4`
+    /// bytes). On Windows this complements the embedded executable icon —
+    /// the exe icon covers file-explorer / pinned shortcuts, this covers
+    /// the live window. Silently ignored if the byte length doesn't match
+    /// `width * height * 4` (handled at window creation).
+    pub fn window_icon_rgba(mut self, width: u32, height: u32, rgba: Vec<u8>) -> Self {
+        self.config.window_icon = Some((width, height, rgba));
         self
     }
 
@@ -808,7 +823,7 @@ impl App {
         // both read from `total_height_logical()` / `prefix`, so
         // those need to be current before either runs.
         self.ensure_lazy_list_prefixes();
-        // CPU sub-phase timing (logged under FROSTIFY_STATS): pinpoints
+        // CPU sub-phase timing (logged under OPAL_STATS): pinpoints
         // where a scroll frame's CPU goes — layout vs flatten vs expand +
         // upload — so the scroll-path optimization targets the real hotspot.
         let t_layout = Instant::now();
@@ -3608,7 +3623,7 @@ impl ApplicationHandler for App {
         }
         event_loop.set_control_flow(ControlFlow::Wait);
 
-        let attrs = Window::default_attributes()
+        let mut attrs = Window::default_attributes()
             .with_title(self.config.title.clone())
             .with_transparent(self.config.transparent)
             .with_decorations(self.config.decorations)
@@ -3623,6 +3638,14 @@ impl ApplicationHandler for App {
                 self.config.width as f64,
                 self.config.height as f64,
             ));
+        // Configured window icon (taskbar / alt-tab). Fail-soft: a
+        // mismatched buffer just leaves winit on the exe-icon fallback.
+        if let Some((w, h, rgba)) = self.config.window_icon.clone() {
+            match winit::window::Icon::from_rgba(rgba, w, h) {
+                Ok(icon) => attrs = attrs.with_window_icon(Some(icon)),
+                Err(e) => log::warn!("window icon ignored: {e}"),
+            }
+        }
         let window = event_loop
             .create_window(attrs)
             .expect("failed to create window");

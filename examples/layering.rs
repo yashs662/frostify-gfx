@@ -13,14 +13,14 @@
 
 mod common;
 
-use frostify_gfx::{App, Justify, Len, Scene};
+use opal_gfx::{App, Justify, Len, Scene};
 
 use common::image::make_demo_image;
 
 const W: u32 = 720;
 const H: u32 = 420;
 
-fn build(s: &mut Scene, art: frostify_gfx::ImageHandle) {
+fn build(s: &mut Scene, art: opal_gfx::ImageHandle) {
     s.col("root")
         .fill()
         .pad(20.0)

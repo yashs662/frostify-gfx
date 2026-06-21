@@ -13,7 +13,7 @@ mod common;
 
 use std::rc::Rc;
 
-use frostify_gfx::{App, BarSide, Justify, Len, Scene};
+use opal_gfx::{App, BarSide, Justify, Len, Scene};
 
 use common::image::hsv;
 

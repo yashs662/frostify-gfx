@@ -17,7 +17,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use frostify_gfx::{App, Justify, Len, Scene};
+use opal_gfx::{App, Justify, Len, Scene};
 
 const W: u32 = 720;
 const H: u32 = 360;

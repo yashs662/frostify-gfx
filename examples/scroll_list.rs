@@ -17,7 +17,7 @@
 //! inner row to nudge it horizontally without leaving the row. Use
 //! arrow keys / PageUp / PageDown / Home / End for keyboard nav.
 
-use frostify_gfx::{App, BarSide, Justify, Len, Scene};
+use opal_gfx::{App, BarSide, Justify, Len, Scene};
 
 const W: u32 = 540;
 const H: u32 = 540;

@@ -13,8 +13,8 @@
 //! has no layer below its glass. Run headless:
 //!     cargo run --example glass_over_layer
 
-use frostify_gfx::gpu::LayerDraw;
-use frostify_gfx::{App, Len, Scene};
+use opal_gfx::gpu::LayerDraw;
+use opal_gfx::{App, Len, Scene};
 
 const W: u32 = 600;
 const H: u32 = 400;
@@ -77,7 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .init();
 
-    let app = App::new("frostify-gfx — glass over layer", W, H)
+    let app = App::new("opal-gfx — glass over layer", W, H)
         .scene(build_scene)
         .headless(|h| {
             let boxid = h
@@ -89,7 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let layers = h.layer_tree.layers().len();
             assert!(layers >= 2, "expected root + promoted box layer, got {layers}");
 
-            let rebuild_draws = |h: &mut frostify_gfx::HeadlessHelper| {
+            let rebuild_draws = |h: &mut opal_gfx::HeadlessHelper| {
                 let draws: Vec<LayerDraw> = h
                     .layer_tree
                     .layers()

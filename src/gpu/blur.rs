@@ -55,7 +55,7 @@ impl BlurResources {
     pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
         let mip_count = mip_count_for(width, height);
         let (backdrop_tex, backdrop_view) =
-            make_tex(device, width, height, mip_count, "frostify.backdrop");
+            make_tex(device, width, height, mip_count, "opal.backdrop");
         let backdrop_mip0_view = make_mip0_view(&backdrop_tex);
 
         // Sampler used by glass shapes. Linear mipmap filter is
@@ -63,7 +63,7 @@ impl BlurResources {
         // uv, fractional_lod)` into a trilinear blend between adjacent
         // mip levels.
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("frostify.backdrop sampler"),
+            label: Some("opal.backdrop sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
@@ -74,7 +74,7 @@ impl BlurResources {
         });
 
         let downsample_samp = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("frostify.downsample sampler"),
+            label: Some("opal.downsample sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
@@ -85,12 +85,12 @@ impl BlurResources {
         });
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("frostify.downsample shader"),
+            label: Some("opal.downsample shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/downsample.wgsl").into()),
         });
 
         let downsample_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("frostify.downsample bgl"),
+            label: Some("opal.downsample bgl"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -122,14 +122,14 @@ impl BlurResources {
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("frostify.downsample pl"),
+            label: Some("opal.downsample pl"),
             bind_group_layouts: &[Some(&downsample_bgl)],
             immediate_size: 0,
         });
 
         let downsample_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("frostify.downsample pipeline"),
+                label: Some("opal.downsample pipeline"),
                 layout: Some(&pipeline_layout),
                 module: &shader,
                 entry_point: Some("cs_main"),
@@ -165,7 +165,7 @@ impl BlurResources {
             return;
         }
         let mip_count = mip_count_for(width, height);
-        let (tex, view) = make_tex(device, width, height, mip_count, "frostify.backdrop");
+        let (tex, view) = make_tex(device, width, height, mip_count, "opal.backdrop");
         let mip0 = make_mip0_view(&tex);
         self.backdrop_tex = tex;
         self.backdrop_view = view;
@@ -192,7 +192,7 @@ impl BlurResources {
             let gx = dst_w.div_ceil(8);
             let gy = dst_h.div_ceil(8);
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("frostify.downsample"),
+                label: Some("opal.downsample"),
                 timestamp_writes: None,
             });
             cpass.set_pipeline(&self.downsample_pipeline);
@@ -212,7 +212,7 @@ fn mip_count_for(width: u32, height: u32) -> u32 {
 
 fn make_mip0_view(tex: &wgpu::Texture) -> wgpu::TextureView {
     tex.create_view(&wgpu::TextureViewDescriptor {
-        label: Some("frostify.backdrop.mip0"),
+        label: Some("opal.backdrop.mip0"),
         base_mip_level: 0,
         mip_level_count: Some(1),
         ..Default::default()
@@ -258,19 +258,19 @@ fn build_downsample_bgs(
     let mut out = Vec::with_capacity(mip_count.saturating_sub(1) as usize);
     for i in 0..mip_count.saturating_sub(1) {
         let src_view = tex.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("frostify.downsample.src"),
+            label: Some("opal.downsample.src"),
             base_mip_level: i,
             mip_level_count: Some(1),
             ..Default::default()
         });
         let dst_view = tex.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("frostify.downsample.dst"),
+            label: Some("opal.downsample.dst"),
             base_mip_level: i + 1,
             mip_level_count: Some(1),
             ..Default::default()
         });
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("frostify.downsample bg"),
+            label: Some("opal.downsample bg"),
             layout,
             entries: &[
                 wgpu::BindGroupEntry {

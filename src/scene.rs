@@ -227,7 +227,7 @@ fn tombstone_matching<T>(
 /// dropped slots and stops their tweens; new pushes append (don't
 /// re-use tombstones) — historically slot count grew monotonically with
 /// every reactive prop ever declared, which is *not* bounded under a
-/// per-track-change rebuild cadence (Frostify rebuilds the Home scene
+/// per-track-change rebuild cadence (Opal rebuilds the Home scene
 /// several times per song). Each prop kind now keeps a free-list of
 /// tombstoned indices; [`alloc_slot`] reuses one before appending, so
 /// the vectors plateau at the high-water mark of *concurrently-live*

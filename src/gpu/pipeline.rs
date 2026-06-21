@@ -29,12 +29,12 @@ impl ShapePipeline {
         image_bgl: &wgpu::BindGroupLayout,
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("frostify.shape shader"),
+            label: Some("opal.shape shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/shape.wgsl").into()),
         });
 
         let shape_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("frostify.shape bgl"),
+            label: Some("opal.shape bgl"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -64,7 +64,7 @@ impl ShapePipeline {
         });
 
         let glass_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("frostify.shape.glass bgl"),
+            label: Some("opal.shape.glass bgl"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -92,7 +92,7 @@ impl ShapePipeline {
         // both passes; this lets text and images participate in the
         // backdrop and appear blurred behind glass panels.
         let opaque_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("frostify.shape.opaque pl"),
+            label: Some("opal.shape.opaque pl"),
             bind_group_layouts: &[
                 Some(&shape_bgl),
                 None,
@@ -104,7 +104,7 @@ impl ShapePipeline {
 
         // Final pipeline layout: bind groups 0..=3.
         let final_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("frostify.shape.final pl"),
+            label: Some("opal.shape.final pl"),
             bind_group_layouts: &[
                 Some(&shape_bgl),
                 Some(&glass_bgl),
@@ -168,12 +168,12 @@ impl ShapePipeline {
         };
 
         let opaque_pipeline =
-            make_pipeline("frostify.shape.opaque", &opaque_layout, "fs_opaque", BACKDROP_FORMAT);
+            make_pipeline("opal.shape.opaque", &opaque_layout, "fs_opaque", BACKDROP_FORMAT);
         let final_pipeline =
-            make_pipeline("frostify.shape.final", &final_layout, "fs_main", surface_format);
+            make_pipeline("opal.shape.final", &final_layout, "fs_main", surface_format);
 
         let frame_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("frostify.frame ubo"),
+            label: Some("opal.frame ubo"),
             contents: bytemuck::bytes_of(&FrameUniform {
                 screen_size: [1.0, 1.0],
                 max_backdrop_lod: 0.0,

@@ -10,7 +10,7 @@
 //!
 //!     cargo run --example lazy_scroll_skip
 
-use frostify_gfx::{App, Len, Scene};
+use opal_gfx::{App, Len, Scene};
 
 const W: u32 = 500;
 const H: u32 = 600;
@@ -32,7 +32,7 @@ fn build_scene(s: &mut Scene) {
     });
 }
 
-fn scroll_layer_present(h: &frostify_gfx::HeadlessHelper, list: frostify_gfx::NodeId) -> bool {
+fn scroll_layer_present(h: &opal_gfx::HeadlessHelper, list: opal_gfx::NodeId) -> bool {
     h.layer_tree
         .layers()
         .iter()
@@ -45,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .init();
 
-    let app = App::new("frostify-gfx — lazy scroll skip", W, H)
+    let app = App::new("opal-gfx — lazy scroll skip", W, H)
         .scene(build_scene)
         .headless(|h| {
             let list = h.ctx.node("list").expect("list node");

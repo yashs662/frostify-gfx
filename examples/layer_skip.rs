@@ -7,8 +7,8 @@
 //! Run headless (renders two frames, checks stats, exits):
 //!     cargo run --example layer_skip
 
-use frostify_gfx::gpu::LayerDraw;
-use frostify_gfx::{App, Len, Scene};
+use opal_gfx::gpu::LayerDraw;
+use opal_gfx::{App, Len, Scene};
 
 const W: u32 = 600;
 const H: u32 = 400;
@@ -42,10 +42,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The shell's `resumed` already did the initial flush + render (which
     // rasterizes every layer once). The headless closure then probes the
     // damage split directly.
-    let app = App::new("frostify-gfx — layer skip", W, H)
+    let app = App::new("opal-gfx — layer skip", W, H)
         .scene(build_scene)
         .headless(|h| {
-            let rebuild_draws = |h: &mut frostify_gfx::HeadlessHelper| {
+            let rebuild_draws = |h: &mut opal_gfx::HeadlessHelper| {
                 let draws: Vec<LayerDraw> = h
                     .layer_tree
                     .layers()

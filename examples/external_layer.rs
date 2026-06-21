@@ -10,7 +10,7 @@
 //!
 //!     cargo run --example external_layer
 
-use frostify_gfx::{App, Len, Scene};
+use opal_gfx::{App, Len, Scene};
 
 const W: u32 = 400;
 const H: u32 = 300;
@@ -39,7 +39,7 @@ fn build_scene(s: &mut Scene) {
 /// view (what a decoder would hand the compositor each frame). Colour is
 /// premultiplied straight bytes (opaque → rgb as-is).
 fn solid_view(
-    gpu: &frostify_gfx::gpu::GpuContext,
+    gpu: &opal_gfx::gpu::GpuContext,
     w: u32,
     h: u32,
     rgba: [u8; 4],
@@ -101,7 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .init();
 
-    let app = App::new("frostify-gfx — external layer", W, H)
+    let app = App::new("opal-gfx — external layer", W, H)
         .scene(build_scene)
         .headless(|h| {
             let video = h.ctx.node("video").expect("video node");

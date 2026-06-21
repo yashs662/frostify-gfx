@@ -19,7 +19,7 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use frostify_gfx::{Align, App, Justify, Len, Scene, Signal, WindowAction};
+use opal_gfx::{Align, App, Justify, Len, Scene, Signal, WindowAction};
 
 const W: u32 = 720;
 const H: u32 = 460;

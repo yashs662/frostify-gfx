@@ -184,7 +184,7 @@ impl GpuContext {
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
-                label: Some("frostify-gfx device"),
+                label: Some("opal-gfx device"),
                 required_features,
                 required_limits: wgpu::Limits::default().using_resolution(adapter.limits()),
                 memory_hints: wgpu::MemoryHints::Performance,
@@ -259,7 +259,7 @@ impl GpuContext {
         // Allocate an initial instance buffer with room for one shape.
         let instance_capacity: u64 = 16;
         let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("frostify.instance ssbo"),
+            label: Some("opal.instance ssbo"),
             size: instance_capacity * std::mem::size_of::<ShapeInstance>() as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -280,7 +280,7 @@ impl GpuContext {
 
         let overlay_capacity: u64 = 16;
         let overlay_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("frostify.overlay ssbo"),
+            label: Some("opal.overlay ssbo"),
             size: overlay_capacity * std::mem::size_of::<ShapeInstance>() as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -679,7 +679,7 @@ impl GpuContext {
                 new_cap *= 2;
             }
             self.instance_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("frostify.instance ssbo"),
+                label: Some("opal.instance ssbo"),
                 size: new_cap * stride,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
@@ -879,7 +879,7 @@ impl GpuContext {
                 new_cap *= 2;
             }
             self.overlay_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("frostify.overlay ssbo"),
+                label: Some("opal.overlay ssbo"),
                 size: new_cap * std::mem::size_of::<ShapeInstance>() as u64,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
@@ -948,7 +948,7 @@ impl GpuContext {
                 _ => None,
             };
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("frostify.layer raster"),
+                label: Some("opal.layer raster"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: self.layers.raster_view(i),
                     resolve_target: None,
@@ -1194,7 +1194,7 @@ impl GpuContext {
                 };
                 {
                     let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("frostify.backdrop pass"),
+                        label: Some("opal.backdrop pass"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                             view: &self.blur.backdrop_mip0_view,
                             resolve_target: None,
@@ -1292,7 +1292,7 @@ impl GpuContext {
         // translucent layers can't leak the back one at the arc).
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("frostify.composite pass"),
+                label: Some("opal.composite pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: self.window_round.frame_view(),
                     resolve_target: None,
@@ -1335,7 +1335,7 @@ impl GpuContext {
             self.window_round
                 .set_uniform(&self.queue, self.window_corner_radius);
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("frostify.window_round pass"),
+                label: Some("opal.window_round pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: final_view,
                     resolve_target: None,
@@ -1375,7 +1375,7 @@ impl GpuContext {
                     _ => None,
                 };
                 let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("frostify.overdraw count"),
+                    label: Some("opal.overdraw count"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &self.overdraw.count_view,
                         resolve_target: None,
@@ -1408,7 +1408,7 @@ impl GpuContext {
                         _ => None,
                     };
                 let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("frostify.overdraw compose"),
+                    label: Some("opal.overdraw compose"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: final_view,
                         resolve_target: None,
@@ -1459,7 +1459,7 @@ impl GpuContext {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("frostify-gfx frame"),
+                label: Some("opal-gfx frame"),
             });
 
         self.encode_frame(&mut encoder, &view);
@@ -1560,7 +1560,7 @@ impl GpuContext {
         let height = self.surface_config.height;
 
         let target = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("frostify.capture target"),
+            label: Some("opal.capture target"),
             size: wgpu::Extent3d {
                 width,
                 height,
@@ -1583,7 +1583,7 @@ impl GpuContext {
         let readback_size = (padded_bpr as u64) * height as u64;
 
         let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("frostify.capture readback"),
+            label: Some("opal.capture readback"),
             size: readback_size,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -1592,7 +1592,7 @@ impl GpuContext {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("frostify.capture encoder"),
+                label: Some("opal.capture encoder"),
             });
 
         self.encode_frame(&mut encoder, &view);
@@ -1715,7 +1715,7 @@ fn make_shape_bg(
     instance_buffer: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("frostify.shape bg"),
+        label: Some("opal.shape bg"),
         layout: &shape.shape_bgl,
         entries: &[
             wgpu::BindGroupEntry {
@@ -1736,7 +1736,7 @@ fn make_glass_bg(
     blur: &BlurResources,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("frostify.glass bg"),
+        label: Some("opal.glass bg"),
         layout: &shape.glass_bgl,
         entries: &[
             wgpu::BindGroupEntry {

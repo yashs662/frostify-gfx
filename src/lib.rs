@@ -1,4 +1,4 @@
-//! frostify-gfx — reactive GPU UI rendering library.
+//! opal-gfx — reactive GPU UI rendering library.
 //!
 //! Transparent window, SDF shapes with solid colors and frosted glass
 //! (per-instance blur + edge refraction), text via cosmic-text, image

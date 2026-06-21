@@ -1,4 +1,4 @@
-//! Reusable scene components for the frostify-gfx examples.
+//! Reusable scene components for the opal-gfx examples.
 //!
 //! Component shape:
 //!   - Each is a plain `fn name(s: &mut Scene, props: Props)`.
@@ -15,7 +15,7 @@
 
 use std::time::Duration;
 
-use frostify_gfx::{
+use opal_gfx::{
     animated, deps, Align, Computed, Curve, ImageHandle, Len, Scene, Signal, WindowAction,
 };
 

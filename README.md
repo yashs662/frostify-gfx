@@ -1,2 +1,2 @@
-# frostify-gfx
-Graphics library for Frostify
+# opal-gfx
+Graphics library for Opal

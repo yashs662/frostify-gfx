@@ -1,5 +1,5 @@
 [package]
-name = "frostify-gfx"
+name = "opal-gfx"
 version = "0.0.0"
 edition = "2024"
 description = "Reactive GPU UI rendering library"

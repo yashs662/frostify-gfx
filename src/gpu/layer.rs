@@ -226,12 +226,12 @@ impl LayerResources {
         instance_buffer: &wgpu::Buffer,
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("frostify.composite shader"),
+            label: Some("opal.composite shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/composite.wgsl").into()),
         });
 
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("frostify.composite bgl"),
+            label: Some("opal.composite bgl"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -267,7 +267,7 @@ impl LayerResources {
         });
 
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("frostify.composite pl"),
+            label: Some("opal.composite pl"),
             bind_group_layouts: &[Some(&bgl)],
             immediate_size: 0,
         });
@@ -322,12 +322,12 @@ impl LayerResources {
                 cache: None,
             })
         };
-        let pipeline = make_pipeline(format, "frostify.composite pipeline");
+        let pipeline = make_pipeline(format, "opal.composite pipeline");
         // P4: composites below-glass content into the linear backdrop
         // texture (blur input). Unused until the segment walk lands.
         let backdrop_pipeline = make_pipeline(
             super::blur::BACKDROP_FORMAT,
-            "frostify.composite→backdrop pipeline",
+            "opal.composite→backdrop pipeline",
         );
 
         // Nearest sampling: a 1:1-px composite window maps the quad to the
@@ -336,7 +336,7 @@ impl LayerResources {
         // boundary. Sub-pixel scroll offsets land between texels; nearest
         // snaps, which reads crisp (no half-pixel smear).
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("frostify.composite sampler"),
+            label: Some("opal.composite sampler"),
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest,
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
@@ -346,7 +346,7 @@ impl LayerResources {
         // `linear_sampler` field doc. Clamp to edge so the bilinear tap at
         // the frame border doesn't wrap.
         let linear_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("frostify.composite sampler (linear)"),
+            label: Some("opal.composite sampler (linear)"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
@@ -379,7 +379,7 @@ impl LayerResources {
     ) -> LayerTexture {
         let size = [size[0].max(1), size[1].max(1)];
         let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("frostify.layer texture"),
+            label: Some("opal.layer texture"),
             size: wgpu::Extent3d {
                 width: size[0],
                 height: size[1],
@@ -394,13 +394,13 @@ impl LayerResources {
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("frostify.composite ubo"),
+            label: Some("opal.composite ubo"),
             size: std::mem::size_of::<CompositeUniform>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("frostify.composite bg"),
+            label: Some("opal.composite bg"),
             layout: &self.bgl,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -418,7 +418,7 @@ impl LayerResources {
             ],
         });
         let frame = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("frostify.layer frame ubo"),
+            label: Some("opal.layer frame ubo"),
             size: std::mem::size_of::<FrameUniform>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -603,7 +603,7 @@ impl LayerResources {
         external_view: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("frostify.composite bg (external)"),
+            label: Some("opal.composite bg (external)"),
             layout: &self.bgl,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -653,7 +653,7 @@ fn make_raster_bg(
     instance_buffer: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("frostify.layer raster bg"),
+        label: Some("opal.layer raster bg"),
         layout: shape_bgl,
         entries: &[
             wgpu::BindGroupEntry {

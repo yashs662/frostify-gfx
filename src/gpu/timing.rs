@@ -112,12 +112,12 @@ type MapMsg = (usize, Result<(), wgpu::BufferAsyncError>);
 impl Timing {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
         let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
-            label: Some("frostify.timing qs"),
+            label: Some("opal.timing qs"),
             ty: wgpu::QueryType::Timestamp,
             count: QUERY_COUNT,
         });
         let resolve = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("frostify.timing resolve"),
+            label: Some("opal.timing resolve"),
             size: RESOLVE_BYTES,
             usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
@@ -132,13 +132,13 @@ impl Timing {
         };
         let slots = [
             ReadbackSlot {
-                buffer: mk_slot_buffer("frostify.timing readback[0]"),
+                buffer: mk_slot_buffer("opal.timing readback[0]"),
                 state: SlotState::Idle,
                 alloc: PassAlloc::new(),
                 bytes: 0,
             },
             ReadbackSlot {
-                buffer: mk_slot_buffer("frostify.timing readback[1]"),
+                buffer: mk_slot_buffer("opal.timing readback[1]"),
                 state: SlotState::Idle,
                 alloc: PassAlloc::new(),
                 bytes: 0,
