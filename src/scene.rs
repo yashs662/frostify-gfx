@@ -1060,8 +1060,22 @@ impl<'a> NodeBuilderRef<'a> {
         self
     }
 
-    /// Force-promote this subtree to its own compositor layer. See
-    /// [`crate::node::Node::layer`].
+    /// Force-promote this subtree to its own compositor layer: its children
+    /// rasterize into one offscreen texture that is then composited as a unit.
+    /// This is the primitive for **"render several things, then treat the
+    /// result as one"** — compositing the group once avoids the artifacts of
+    /// stacking translucent/rounded siblings (each child's own anti-aliased
+    /// edge can otherwise reveal the one behind it).
+    ///
+    /// Composite-time effects apply to the *group's result*, not each child:
+    /// - [`Self::layer_opacity`] — fade the whole group (no re-raster).
+    /// - [`Self::layer_offset_x`] — translate it.
+    /// - a [`Self::radius`] on this node — **round the composited result
+    ///   once** at the node's rect (draw children square; one clean corner).
+    ///   That's how e.g. a crossfading album cover rounds without the
+    ///   outgoing cover leaking through the incoming one's corner.
+    ///
+    /// See [`crate::node::Node::layer`].
     pub fn layer(&mut self) -> &mut Self {
         if let Some(n) = self.ctx.tree.get_mut_raw(self.id) {
             n.layer = true;
@@ -1740,6 +1754,46 @@ impl<'a> NodeBuilderRef<'a> {
                 n.interact.hover = Some(Signal::new(false));
             }
             n.on_hover_dwell = Some((duration, handler));
+        }
+        self
+    }
+
+    /// Show a small text tooltip when the pointer dwells on this node, then
+    /// hide it on leave — the engine renders + positions it near the node, no
+    /// extra wiring. Ideal for icon-only / collapsed controls where the label
+    /// isn't visible (e.g. a collapsed sidebar's playlist icons).
+    pub fn hover_hint(&mut self, text: impl Into<String>) -> &mut Self {
+        if let Some(n) = self.ctx.tree.get_mut_raw(self.id) {
+            if n.interact.hover.is_none() {
+                n.interact.hover = Some(Signal::new(false));
+            }
+            n.hover_hint = Some(text.into());
+        }
+        self
+    }
+
+    /// Reactive variant of [`Self::hover_hint`]: the tooltip text tracks a
+    /// [`TextSignal`] so it updates without a rebuild (e.g. a like icon whose
+    /// hint lists the playlists the current track is in). An empty string
+    /// suppresses the tooltip.
+    pub fn hover_hint_bind(&mut self, signal: crate::signal::TextSignal) -> &mut Self {
+        if let Some(n) = self.ctx.tree.get_mut_raw(self.id) {
+            if n.interact.hover.is_none() {
+                n.interact.hover = Some(Signal::new(false));
+            }
+            n.hover_hint_text = Some(signal);
+        }
+        self
+    }
+
+    /// Fallback fill shown by an image node while its handle is unresolved
+    /// (a built-in loading placeholder, rounded by the node's own radius).
+    /// Use instead of stacking a separate placeholder rect behind the cover —
+    /// one rounded node can't reveal a layer through its corner. No-op on a
+    /// non-image node.
+    pub fn placeholder_fill(&mut self, color: [f32; 4]) -> &mut Self {
+        if let Some(n) = self.ctx.tree.get_mut_raw(self.id) {
+            n.placeholder_color = Some(color);
         }
         self
     }

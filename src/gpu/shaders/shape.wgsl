@@ -215,6 +215,38 @@ fn sd_rounded_rect(p: vec2<f32>, xy: vec2<f32>, r: vec4<f32>) -> f32 {
     return sd_rectangle(p, xy - vec2<f32>(s)) - s;
 }
 
+// Fill coverage for a rounded rect that keeps STRAIGHT edges fully covered
+// (hard, up to the geometric edge) and anti-aliases only the rounded CORNERS.
+// A translucent panel/glass whose edge lands mid-pixel otherwise feathers its
+// axis-aligned edge to ~50%, and over content/backdrop that reads as a 1px
+// brighter seam (e.g. a sticky header's top edge). Axis-aligned edges don't
+// need AA, so cutting them hard removes the seam while corners still round.
+// `half` = half-size, `r` = [TL,TR,BL,BR] (as `sd_rounded_rect`), `aa` = AA
+// half-width.
+fn rounded_coverage(p: vec2<f32>, half: vec2<f32>, r: vec4<f32>, aa: f32) -> f32 {
+    let ap = abs(p);
+    if (ap.x > half.x || ap.y > half.y) {
+        return 0.0;
+    }
+    let qx = select(0u, 1u, p.x > 0.0);
+    let qy = select(0u, 2u, p.y > 0.0);
+    let idx = qx + qy;
+    var s: f32;
+    switch idx {
+        case 0u: { s = r.x; }
+        case 1u: { s = r.y; }
+        case 2u: { s = r.z; }
+        default: { s = r.w; }
+    }
+    s = min(s, min(half.x, half.y));
+    let corner = half - vec2<f32>(s);
+    if (s > 0.0 && ap.x > corner.x && ap.y > corner.y) {
+        let d = length(ap - corner) - s;
+        return smoothstep(aa, -aa, d);
+    }
+    return 1.0;
+}
+
 struct Body { rgb: vec3<f32>, a: f32 };
 
 // Rect / border fill — shared between both fragment entry points.
@@ -346,7 +378,9 @@ fn fs_opaque(in: VSOut) -> @location(0) vec4<f32> {
         let radii_s = inst.border_radius * inst.scale.x;
         let comp_dist = sd_rounded_rect(p, outer_half, radii_s);
         let aa = max(fwidth(comp_dist), 0.5);
-        let comp_alpha = smoothstep(aa, -aa, comp_dist);
+        // Hard straight edges + rounded corners — no 1px lighter border where
+        // an album cover's edge would otherwise feather over the placeholder.
+        let comp_alpha = rounded_coverage(p, outer_half, radii_s, aa);
         let tint_lin = srgb_to_linear(inst.color.rgb);
         let a = sample.a * inst.color.a * inst.opacity * comp_alpha;
         let rgb = sample.rgb * tint_lin * a;
@@ -359,7 +393,8 @@ fn fs_opaque(in: VSOut) -> @location(0) vec4<f32> {
     let radii_scaled = inst.border_radius * inst.scale.x;
     let comp_dist = sd_rounded_rect(p, outer_half, radii_scaled);
     let aa = max(fwidth(comp_dist), 0.5);
-    let comp_alpha = smoothstep(aa, -aa, comp_dist);
+    // Hard straight edges + rounded corners (no 1px edge seam over backdrop).
+    let comp_alpha = rounded_coverage(p, outer_half, radii_scaled, aa);
 
     let body = compute_fill(inst, p, outer_half, comp_alpha, aa);
     let shadow = compute_shadow(inst, px, center, outer_half);
@@ -367,21 +402,6 @@ fn fs_opaque(in: VSOut) -> @location(0) vec4<f32> {
     let out_a = body.a + shadow.a * (1.0 - body.a);
     let out_rgb = body.rgb + shadow.rgb * (1.0 - body.a);
     return vec4<f32>(out_rgb, out_a) * inst.opacity;
-}
-
-// Coverage of the window-corner SDF at `px`. `1.0` inside the rounded
-// boundary, `0.0` outside, with sub-pixel anti-aliasing at the rim.
-// `1.0` when the radius is disabled — caller can multiply unconditionally.
-fn window_corner_coverage(px: vec2<f32>) -> f32 {
-    if (frame.window_corner_radius <= 0.0) {
-        return 1.0;
-    }
-    let win_half = frame.screen_size * 0.5;
-    let win_p = px - win_half;
-    let win_r = vec4<f32>(frame.window_corner_radius);
-    let win_d = sd_rounded_rect(win_p, win_half, win_r);
-    let win_aa = max(fwidth(win_d), 0.5);
-    return smoothstep(win_aa, -win_aa, win_d);
 }
 
 // Fragment entry for the final surface pass. Handles glass by sampling
@@ -402,13 +422,12 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         px.x > inst.clip_rect.z || px.y > inst.clip_rect.w) {
         discard;
     }
-    // Window-corner clip applies to every shape kind. Each branch
-    // multiplies its final output by `win_cov` so glyphs, images, and
-    // glass all respect the rounded boundary — the original
-    // implementation only clipped the generic rect path, which left
-    // the album-art image visible in the corners. Fold the rounded-clip
-    // coverage in here so it rides the same multiply for free.
-    let win_cov = window_corner_coverage(px) * clip_cov;
+    // The window corner is rounded *once* on the composited frame by the
+    // final `window_round` pass (see `shaders/window_round.wgsl`), not per
+    // instance here — so stacked translucent layers can't leak the back one
+    // through a per-layer corner. Each branch still multiplies by the rounded
+    // overflow-scissor coverage (`clip_cov`).
+    let win_cov = clip_cov;
 
     if ((inst.shape_kind & SHAPE_KIND_MASK) == SHAPE_KIND_GLYPH) {
         // `backdrop_uv_rect` = (u0, v0, w, h) into the R8 glyph atlas.
@@ -441,7 +460,9 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         let radii_s = inst.border_radius * inst.scale.x;
         let comp_dist = sd_rounded_rect(p, outer_half, radii_s);
         let aa = max(fwidth(comp_dist), 0.5);
-        let comp_alpha = smoothstep(aa, -aa, comp_dist);
+        // Hard straight edges + rounded corners — no 1px lighter border where
+        // an album cover's edge would otherwise feather over the placeholder.
+        let comp_alpha = rounded_coverage(p, outer_half, radii_s, aa);
         let tint_lin = srgb_to_linear(inst.color.rgb);
         let a = sample.a * inst.color.a * inst.opacity * comp_alpha;
         let rgb = sample.rgb * tint_lin * a;
@@ -454,7 +475,9 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let radii_scaled = inst.border_radius * inst.scale.x;
     let comp_dist = sd_rounded_rect(p, outer_half, radii_scaled);
     let aa = max(fwidth(comp_dist), 0.5);
-    let comp_alpha = smoothstep(aa, -aa, comp_dist);
+    // Hard straight edges + rounded corners — no 1px translucent-edge seam
+    // over the content/backdrop. `comp_dist` still drives refraction + shadow.
+    let comp_alpha = rounded_coverage(p, outer_half, radii_scaled, aa);
 
     var body: Body;
     if ((inst.shape_kind & SHAPE_KIND_MASK) == SHAPE_KIND_GLASS) {

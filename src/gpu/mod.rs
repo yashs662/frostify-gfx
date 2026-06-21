@@ -7,6 +7,7 @@ pub mod layer;
 pub mod overdraw;
 pub mod pipeline;
 pub mod timing;
+pub mod window_round;
 
 pub use blur::{BlurResources, BACKDROP_FORMAT};
 pub use context::{GpuContext, MemoryReport};

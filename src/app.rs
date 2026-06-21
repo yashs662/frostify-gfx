@@ -66,6 +66,17 @@ const BIND_TWEEN_KEY_OPACITY: u32 = 0xC300_0000;
 const DRAG_RETURN_TWEEN_KEY: u32 = 0xD000_0000;
 /// Snap-back duration when a dragged node returns to its resting slot.
 const DRAG_RETURN_MS: u64 = 160;
+/// Hover delay before a `hover_hint` tooltip starts fading in (the dwell
+/// window when a node has a hint but no explicit `on_hover_dwell` duration).
+/// Short + paired with a fade so it reveals quickly without popping.
+const HINT_DWELL: Duration = Duration::from_millis(110);
+/// Fade in / out duration for a `hover_hint` tooltip.
+const HINT_FADE: Duration = Duration::from_millis(120);
+/// Debounce window for re-deriving hover when the scene changes under a
+/// stationary cursor (scroll, a slider morphing content, an async update).
+/// Picked so a continuous change re-checks hover ~10×/s (no per-frame thrash)
+/// and the last-armed check lands shortly after movement stops.
+const HOVER_RECHECK: Duration = Duration::from_millis(90);
 
 #[derive(Clone, Debug)]
 pub struct AppConfig {
@@ -366,6 +377,23 @@ pub struct App {
     /// `fired` flips true once the handler has run so we don't refire
     /// from cursor jitter inside the same node.
     dwell: Option<DwellTracker>,
+    /// Node whose `hover_hint` tooltip is currently shown (rendered into the
+    /// overlay buffer). `None` when no hint is up. Set when a hint node's
+    /// dwell fires, cleared on hover-leave / rebuild.
+    active_hint: Option<crate::node::NodeId>,
+    /// A cursor move happened while a hint is shown — repaint it at the new
+    /// position once this frame (coalesced; OS-cursor moves fire at 500+ Hz).
+    pending_hint_repaint: bool,
+    /// Tooltip opacity (0..1), tweened on the timeline: fades in when a hint
+    /// appears, fades out when it leaves. Read by `paint_hint`.
+    hint_fade: crate::signal::Signal<f32>,
+    /// Whether the active hint is fading *in* (`true`, pointer on its node)
+    /// or *out* (`false`, pointer left — finalised once `hint_fade` hits 0).
+    hint_visible: bool,
+    /// Debounced deadline to re-derive hover after the scene changed under a
+    /// stationary cursor. Armed (no-reset) by content-changing flushes; fires
+    /// in `about_to_wait`. See `arm_hover_recheck` / `tick_hover_recheck`.
+    next_hover_recheck: Option<Instant>,
     /// External-wake plumbing for the case where the event loop is
     /// parked on `Wait` (no animation / scroll / dwell) and another
     /// thread (e.g. a worker delivering an async result) needs the UI
@@ -495,6 +523,11 @@ impl App {
             scene_builder: None,
             rebuild_request: std::rc::Rc::new(std::cell::Cell::new(false)),
             dwell: None,
+            active_hint: None,
+            pending_hint_repaint: false,
+            hint_fade: crate::signal::Signal::new(0.0),
+            hint_visible: false,
+            next_hover_recheck: None,
             wake: wake.clone(),
             uploader: crate::uploader::Uploader::new(wake.clone()),
             frame_sink: crate::frame_sink::FrameSink::new(wake),
@@ -888,8 +921,30 @@ impl App {
         // composite-only update — scroll, crossfade, a cursor-following
         // overlay offset — doesn't allocate a fresh Vec each frame.
         self.layer_draw_scratch.clear();
-        self.layer_draw_scratch
-            .extend(self.layer_tree.layers().iter().map(layer_to_draw));
+        let scale = self.scale_factor;
+        for layer in self.layer_tree.layers() {
+            let mut draw = layer_to_draw(layer);
+            // Composite-time corner rounding for a promoted raster `.layer()`
+            // (`root` set, not external/scroll) whose node carries a radius:
+            // round the layer's *composited* result once at its rect, instead
+            // of rounding each child. Lets a grouped card (e.g. an album-cover
+            // crossfade) draw its content square and get a single clean
+            // anti-aliased corner — stacked content can't leak through it.
+            if draw.external.is_none()
+                && draw.window.is_none()
+                && let Some(id) = layer.root
+                && let Some(n) = self.ctx.tree.get(id)
+            {
+                let r = n.style.border_radius[0];
+                if r > 0.0 {
+                    let rect = n.rect; // physical [x, y, w, h]
+                    draw.corner_radius = r * scale;
+                    draw.round_rect =
+                        Some([rect[0], rect[1], rect[0] + rect[2], rect[1] + rect[3]]);
+                }
+            }
+            self.layer_draw_scratch.push(draw);
+        }
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.set_layers(&self.layer_draw_scratch);
         }
@@ -1033,6 +1088,11 @@ impl App {
     /// invalidate any equality check and re-shape 6 lines per render
     /// frame for sub-ms wiggle a human can't read anyway.
     fn refresh_hud_overlay(&mut self) {
+        // A live hover-hint tooltip owns the overlay buffer; don't clobber it
+        // with the debug HUD (the user-facing hint wins).
+        if self.active_hint.is_some() {
+            return;
+        }
         let now = Instant::now();
         let due = self
             .last_hud_refresh
@@ -1055,6 +1115,97 @@ impl App {
             gpu.set_overlay_instances(&[]);
         }
         self.last_hud_refresh = None;
+    }
+
+    /// Resolve a node's tooltip text: the reactive `hover_hint_text` signal
+    /// takes priority (so it can update without a rebuild), falling back to the
+    /// static `hover_hint`. Returns `None` only when the node has neither.
+    fn hint_text(node: &crate::node::Node) -> Option<String> {
+        node.hover_hint_text
+            .as_ref()
+            .map(|s| s.get().to_string())
+            .or_else(|| node.hover_hint.clone())
+    }
+
+    /// Start showing `node`'s `hover_hint` tooltip (its dwell just fired):
+    /// fade it in. Painted at the cursor and re-painted as the pointer moves
+    /// + as the fade advances (see [`Self::paint_hint`]).
+    fn show_hint(&mut self, node: crate::node::NodeId) {
+        self.active_hint = Some(node);
+        self.hint_visible = true;
+        let fade = self.hint_fade.clone();
+        self.timeline
+            .animate(&fade, 1.0, crate::anim::Curve::EaseInOut, HINT_FADE, Instant::now());
+        self.paint_hint();
+    }
+
+    /// Begin fading the active hint *out* (the pointer left its node but is
+    /// still in the window, so the cursor anchor is valid through the fade).
+    /// The pump finalises it once the fade reaches 0.
+    fn hide_hint(&mut self) {
+        if self.active_hint.is_none() || !self.hint_visible {
+            return;
+        }
+        self.hint_visible = false;
+        let fade = self.hint_fade.clone();
+        self.timeline
+            .animate(&fade, 0.0, crate::anim::Curve::EaseInOut, HINT_FADE, Instant::now());
+    }
+
+    /// (Re)render the active hint tooltip into the overlay buffer at the
+    /// current cursor position, at the current fade opacity. Cheap — one pill
+    /// + a short label (glyphs are atlas-cached).
+    fn paint_hint(&mut self) {
+        let Some(node) = self.active_hint else {
+            return;
+        };
+        let Some(text) = self.ctx.tree.get(node).and_then(Self::hint_text) else {
+            // Node gone (rebuild) — drop the hint immediately.
+            self.clear_hint();
+            return;
+        };
+        if text.is_empty() {
+            // Reactive hint resolved to nothing (e.g. track not in any
+            // playlist) — keep the overlay empty rather than a bare pill.
+            self.clear_hint();
+            return;
+        }
+        let cursor = self.input.cursor.unwrap_or([0.0, 0.0]);
+        let fade = self.hint_fade.get().clamp(0.0, 1.0);
+        let scale = self.scale_factor;
+        // Surface size in physical px for edge-clamping the tooltip.
+        let surface = [
+            self.logical_size[0] as f32 * scale,
+            self.logical_size[1] as f32 * scale,
+        ];
+        if let Some(gpu) = self.gpu.as_mut() {
+            let instances =
+                build_hint_instances(&text, cursor, surface, fade, gpu, &mut self.ctx.text, scale);
+            gpu.set_overlay_instances(&instances);
+        }
+        self.request_redraw();
+    }
+
+    /// Immediately remove the hint (no fade): cursor left the window, or the
+    /// scene rebuilt out from under it. Hands the overlay back to the HUD (if
+    /// on) or clears it. No-op when no hint is shown.
+    fn clear_hint(&mut self) {
+        let was = self.active_hint.take().is_some();
+        self.hint_visible = false;
+        let fade = self.hint_fade.clone();
+        self.timeline.stop_for(&fade);
+        self.hint_fade.set(0.0);
+        if !was {
+            return;
+        }
+        if self.hud_enabled {
+            // Force a rebuild past the throttle so the HUD reappears now.
+            self.last_hud_refresh = None;
+            self.refresh_hud_overlay();
+        } else if let Some(gpu) = self.gpu.as_mut() {
+            gpu.set_overlay_instances(&[]);
+        }
+        self.request_redraw();
     }
 
     /// Forward the GPU memory-allocation snapshot from the renderer.
@@ -1123,11 +1274,11 @@ impl App {
                 crate::frame_sink::FrameCmd::Frame { node, frame } => {
                     gpu.upload_external_frame(node, &frame.rgba, frame.width, frame.height);
                 }
-                crate::frame_sink::FrameCmd::Push { node, frame } => {
-                    gpu.push_external_frame(node, &frame.rgba, frame.width, frame.height);
+                crate::frame_sink::FrameCmd::Push { node, epoch, frame } => {
+                    gpu.push_external_frame(node, epoch, &frame.rgba, frame.width, frame.height);
                 }
-                crate::frame_sink::FrameCmd::Select { node, index } => {
-                    gpu.select_external_frame(node, index);
+                crate::frame_sink::FrameCmd::Select { node, epoch, index } => {
+                    gpu.select_external_frame(node, epoch, index);
                 }
                 crate::frame_sink::FrameCmd::Migrate { old, new } => {
                     gpu.migrate_external_frames(old, new);
@@ -1298,6 +1449,57 @@ impl App {
         }
     }
 
+    /// Note that the scene re-flattened (the hit cache changed) so hover may
+    /// be stale under a stationary cursor. Arms a debounced re-check — no
+    /// reset while one is already pending, which both throttles continuous
+    /// change (≈10 Hz) and lets the last-armed check fire once after it
+    /// stops. Cheap no-op when the pointer isn't in the window.
+    fn arm_hover_recheck(&mut self) {
+        if self.input.cursor.is_some() && self.next_hover_recheck.is_none() {
+            self.next_hover_recheck = Some(Instant::now() + HOVER_RECHECK);
+        }
+    }
+
+    /// Fire a due hover re-check: re-run the hit-test at the current cursor
+    /// against the freshly-flattened hits, so a row that scrolled / morphed
+    /// under a still pointer lights up (or un-lights) correctly. Deferred
+    /// while a drag owns the pointer (hover is suppressed then; it fires once
+    /// the drag releases). Returns `true` if hover changed (it reacted).
+    fn tick_hover_recheck(&mut self, now: Instant) -> bool {
+        let Some(deadline) = self.next_hover_recheck else {
+            return false;
+        };
+        if now < deadline {
+            return false;
+        }
+        // A drag/capture owns the pointer — hover is moot until it releases.
+        if self.input.captured.is_some()
+            || self.bar_drag.is_some()
+            || self.drag_origin.is_some()
+        {
+            self.next_hover_recheck = Some(now + HOVER_RECHECK);
+            return false;
+        }
+        self.next_hover_recheck = None;
+        let Some([x, y]) = self.input.cursor else {
+            return false;
+        };
+        let _ = crate::input::update_scrollbar_hover(
+            Some([x, y]),
+            &self.scroll_bars,
+            &mut self.ctx.tree,
+        );
+        let change = self.input.on_cursor_moved(x, y, &self.hits, &self.ctx.tree);
+        if change.hovered_changed {
+            self.refresh_dwell(now);
+        }
+        if change.any() {
+            self.react();
+            return true;
+        }
+        false
+    }
+
     /// Re-sync the hover-dwell tracker against the current hovered
     /// node. Called after any input event that may have changed
     /// `input.hovered`. If the hovered node owns a dwell handler and
@@ -1306,12 +1508,28 @@ impl App {
     /// handler (or no node is hovered), clear the tracker. Idempotent
     /// while hover stays on the same dwell-handler-bearing node.
     fn refresh_dwell(&mut self, now: Instant) {
+        // A node is a dwell target if it has an explicit dwell handler OR a
+        // `hover_hint` tooltip (which uses the same timer + a default delay).
         let hovered_dwell = self.input.hovered.and_then(|id| {
-            self.ctx
-                .tree
-                .get(id)
-                .and_then(|n| n.on_hover_dwell.as_ref().map(|(d, _)| (id, *d)))
+            self.ctx.tree.get(id).and_then(|n| {
+                n.on_hover_dwell
+                    .as_ref()
+                    .map(|(d, _)| *d)
+                    .or_else(|| {
+                        (n.hover_hint.is_some() || n.hover_hint_text.is_some())
+                            .then_some(HINT_DWELL)
+                    })
+                    .map(|d| (id, d))
+            })
         });
+        // Fade a shown hint out the moment hover leaves its node (so it
+        // doesn't linger when the cursor moves to a sibling icon). The cursor
+        // is still in the window, so the fade stays anchored to it.
+        if let Some(hint_node) = self.active_hint
+            && self.input.hovered != Some(hint_node)
+        {
+            self.hide_hint();
+        }
         match (hovered_dwell, self.dwell) {
             (None, _) => self.dwell = None,
             (Some((id, duration)), Some(tracker)) if tracker.node == id => {
@@ -1344,29 +1562,42 @@ impl App {
             self.dwell = None;
             return false;
         }
-        let handler = self
+        let node = tracker.node;
+        let (handler, has_hint) = self
             .ctx
             .tree
-            .get(tracker.node)
-            .and_then(|n| n.on_hover_dwell.as_ref().map(|(_, h)| h.clone()));
-        let Some(h) = handler else {
+            .get(node)
+            .map(|n| {
+                (
+                    n.on_hover_dwell.as_ref().map(|(_, h)| h.clone()),
+                    n.hover_hint.is_some() || n.hover_hint_text.is_some(),
+                )
+            })
+            .unwrap_or((None, false));
+        if handler.is_none() && !has_hint {
             self.dwell = None;
             return false;
-        };
+        }
         // Mark fired *before* invoking so a handler that mutates the
         // tree (and triggers a flush re-evaluating hover) doesn't
         // re-enter and double-fire.
         if let Some(t) = self.dwell.as_mut() {
             t.fired = true;
         }
-        let mut ectx = crate::event::EventCtx {
-            tree: &mut self.ctx.tree,
-            timeline: &mut self.timeline,
-            node: tracker.node,
-            now,
-            cursor: self.input.cursor.unwrap_or([0.0, 0.0]),
-        };
-        h(&mut ectx);
+        // Show the tooltip (if any) for this node.
+        if has_hint {
+            self.show_hint(node);
+        }
+        if let Some(h) = handler {
+            let mut ectx = crate::event::EventCtx {
+                tree: &mut self.ctx.tree,
+                timeline: &mut self.timeline,
+                node,
+                now,
+                cursor: self.input.cursor.unwrap_or([0.0, 0.0]),
+            };
+            h(&mut ectx);
+        }
         true
     }
 
@@ -2085,6 +2316,7 @@ impl App {
             crate::input::update_scrollbar_hover(None, &self.scroll_bars, &mut self.ctx.tree);
         let change = self.input.cancel(&self.hits, &self.ctx.tree);
         self.dwell = None;
+        self.clear_hint();
         if self.last_cursor_icon != CursorIcon::Default {
             self.last_cursor_icon = CursorIcon::Default;
             if let Some(w) = &self.window {
@@ -2211,6 +2443,10 @@ impl App {
         self.input = InputState::new();
         // Stale dwell tracker may point at a destroyed node id.
         self.dwell = None;
+        // A shown hint references the old node id/rect — drop it. If the
+        // cursor still rests on a hint node, the re-derived hover re-arms the
+        // dwell and it reappears after the delay.
+        self.clear_hint();
         // Drag bookkeeping references destroyed node ids — drop it.
         self.clear_drag_state();
         // Layer-opacity / layer-offset bindings hold node ids from the old
@@ -2611,6 +2847,7 @@ fn layer_to_draw(l: &crate::layer::Layer) -> crate::gpu::LayerDraw {
         window,
         external,
         corner_radius,
+        round_rect: None,
         edge_fade: l.edge_fade,
         edge_fade_falloff: if l.edge_fade_falloff > 0.0 {
             l.edge_fade_falloff
@@ -2733,6 +2970,72 @@ fn build_hud_instances(
         })
         .collect();
     out.extend(gpu.build_glyph_instances(text, &refs));
+    out
+}
+
+/// Build a `hover_hint` tooltip (a rounded dark pill + its label) near the
+/// `cursor` (physical px): centred horizontally on the pointer and sitting
+/// just above it (top-middle). Near a side edge it slides in to stay fully
+/// on-screen (so it ends up top-left / top-right there), and it drops below
+/// the cursor only when there isn't room above.
+fn build_hint_instances(
+    text: &str,
+    cursor: [f32; 2],
+    surface: [f32; 2],
+    fade: f32,
+    gpu: &mut crate::gpu::GpuContext,
+    text_res: &mut crate::text::TextResources,
+    scale: f32,
+) -> Vec<ShapeInstance> {
+    use crate::node::TextRef;
+
+    let font_size = 12.5 * scale;
+    let line_h = 17.0 * scale;
+    let pad_x = 9.0 * scale;
+    let pad_y = 5.0 * scale;
+    let radius = 6.0 * scale;
+    // Small vertical gap between the pill and the pointer (kept tight so the
+    // flipped-below pill doesn't sit far from the cursor).
+    let gap_y = 6.0 * scale;
+
+    let m = text_res.measure(text, font_size, line_h);
+    let box_w = m.width + pad_x * 2.0;
+    let box_h = line_h + pad_y * 2.0;
+
+    // Centred on the cursor; the clamp below slides it in near a side edge so
+    // it stays fully visible (becoming top-left / top-right only there).
+    let mut x = cursor[0] - box_w / 2.0;
+    // Above the cursor by `gap_y`; drop just below it only when there isn't
+    // room above (so it never floats far overhead).
+    let mut y = cursor[1] - gap_y - box_h;
+    if y < 0.0 {
+        y = cursor[1] + gap_y;
+    }
+    x = x.clamp(0.0, (surface[0] - box_w).max(0.0));
+    y = y.clamp(0.0, (surface[1] - box_h).max(0.0));
+
+    let fade = fade.clamp(0.0, 1.0);
+    let mut out = Vec::with_capacity(1 + text.len());
+    out.push(ShapeInstance {
+        color: [0.04, 0.04, 0.05, 0.96 * fade],
+        border_color: [1.0, 1.0, 1.0, 0.10 * fade],
+        border_width: 1.0 * scale,
+        position: [x, y],
+        size: [box_w, box_h],
+        border_radius: [radius; 4],
+        ..Default::default()
+    });
+    let refs = [TextRef {
+        position: [x + pad_x, y + pad_y],
+        color: [0.96, 0.96, 0.97, 1.0],
+        opacity: fade,
+        content: text.to_string(),
+        font_size,
+        line_height: line_h,
+        max_width: None,
+        clip_rect: crate::gpu::NO_CLIP,
+    }];
+    out.extend(gpu.build_glyph_instances(text_res, &refs));
     out
 }
 
@@ -3595,6 +3898,13 @@ impl ApplicationHandler for App {
                 if change.hovered_changed {
                     self.refresh_dwell(Instant::now());
                 }
+                // A shown hint follows the pointer — coalesce the move and
+                // repaint it once this frame (`refresh_dwell` above already
+                // cleared it if hover left its node).
+                if self.active_hint.is_some() {
+                    self.pending_hint_repaint = true;
+                    self.request_redraw();
+                }
                 if change.any() || bar_changed || dragged || following {
                     self.react();
                 }
@@ -4073,6 +4383,9 @@ impl ApplicationHandler for App {
             }
             if self.flush_tree() {
                 self.request_redraw();
+                // Worker-delivered content (a list filled in, a row changed)
+                // may have shifted what's under a still cursor.
+                self.arm_hover_recheck();
             }
         }
         // Debug-only scripted-input driver (REMOVABLE — `automation`
@@ -4134,6 +4447,9 @@ impl ApplicationHandler for App {
         // the deadline below so the loop schedules a wake.
         let dwell_fired = self.tick_dwell(now);
         let dwell_pending = self.dwell.as_ref().map(|t| !t.fired).unwrap_or(false);
+        // Re-derive hover if a debounced re-check is due (content changed
+        // under a stationary cursor). Returns true if hover flipped.
+        let hover_rechecked = self.tick_hover_recheck(now);
         // Hold-arrow continuous pump: replaces OS auto-repeat for the
         // arrow keys. Need a non-zero `dt` to compute the per-tick
         // delta — gate on a meaningful tick interval.
@@ -4158,6 +4474,9 @@ impl ApplicationHandler for App {
             && !hover_moved
             && !dwell_pending
             && !dwell_fired
+            && !hover_rechecked
+            && self.next_hover_recheck.is_none()
+            && !self.pending_hint_repaint
             && auto_deadline.is_none()
         {
             self.last_scroll_tick = None;
@@ -4180,6 +4499,24 @@ impl ApplicationHandler for App {
         self.last_scroll_tick = Some(now);
         let scroll_moved = self.ctx.tree.tick_scrolls(dt);
         let res = self.timeline.tick(now);
+        // Hover-hint: repaint while the fade is animating or the cursor moved
+        // (now that the fade value is current), and finalise once a fade-out
+        // reaches zero.
+        if self.active_hint.is_some() {
+            let fade = self.hint_fade.get();
+            let animating = if self.hint_visible {
+                fade < 0.999
+            } else {
+                fade > 0.001
+            };
+            if self.pending_hint_repaint || animating {
+                self.pending_hint_repaint = false;
+                self.paint_hint();
+            }
+            if !self.hint_visible && fade <= 0.01 {
+                self.clear_hint();
+            }
+        }
         // Mirror the snap-back tween into the tree's drag-follow offset
         // (and clear the lift when it lands). The tween keeps the loop
         // awake via `timeline_active`, so this runs every frame of the
@@ -4230,6 +4567,9 @@ impl ApplicationHandler for App {
             }
             if self.flush_tree() {
                 self.request_redraw();
+                // Content moved/morphed (scroll, animation, layout) — hover
+                // may now point at the wrong node under a still cursor.
+                self.arm_hover_recheck();
             }
         }
         let next_scroll_deadline = if self.ctx.tree.has_active_scrolls() || self.bar_drag.is_some()
@@ -4258,6 +4598,14 @@ impl ApplicationHandler for App {
             (None, None) => None,
         };
         let combined = match (combined, dwell_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        // Wake by the hover-recheck deadline (content changed under a still
+        // cursor) so the debounced re-derive lands even when otherwise idle.
+        let combined = match (combined, self.next_hover_recheck) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (Some(a), None) => Some(a),
             (None, Some(b)) => Some(b),

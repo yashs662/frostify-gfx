@@ -774,6 +774,13 @@ pub struct Node {
     pub interact: NodeInteract,
     pub text: Option<NodeText>,
     pub image: Option<ImageHandle>,
+    /// Fallback fill (rounded by `border_radius`) painted by *this* image
+    /// node when it has no resolved handle — a built-in loading placeholder.
+    /// Folding the placeholder into the image node (instead of stacking a
+    /// separate rect behind it) means a loaded cover's rounded corner never
+    /// reveals a layer through its anti-aliased edge. See
+    /// [`crate::scene::NodeBuilderRef::placeholder_fill`].
+    pub placeholder_color: Option<[f32; 4]>,
     pub window_action: Option<WindowAction>,
     /// Click callback fired by the app shell when a left-button release
     /// lands on the same node that captured the press. See
@@ -787,6 +794,16 @@ pub struct Node {
     /// continuously hovering this node for at least the stored
     /// `Duration`. Re-arms whenever hover leaves and re-enters.
     pub on_hover_dwell: Option<(std::time::Duration, crate::event::EventHandler)>,
+    /// Tooltip text shown when the pointer dwells on this node. The engine
+    /// renders a small label near the node (reusing the dwell timer), so an
+    /// icon-only / collapsed control can still say what it is. `None` = no
+    /// hint. See [`crate::scene::NodeBuilderRef::hover_hint`].
+    pub hover_hint: Option<String>,
+    /// Reactive tooltip text — overrides `hover_hint` when present, so a hint
+    /// that varies with state (e.g. the current track's playlists) updates
+    /// with no rebuild. An empty value shows no tooltip. See
+    /// [`crate::scene::NodeBuilderRef::hover_hint_bind`].
+    pub hover_hint_text: Option<crate::signal::TextSignal>,
     /// Sugar-managed color state. Present iff the builder saw
     /// `.hover_color(...)` or `.press_color(...)`; the actual bind slot
     /// lives in `BindRegistry.color` like any other reactive color.
@@ -872,6 +889,8 @@ impl std::fmt::Debug for Node {
                 "on_hover_dwell",
                 &self.on_hover_dwell.as_ref().map(|(d, _)| ("<handler>", d)),
             )
+            .field("hover_hint", &self.hover_hint)
+            .field("hover_hint_text", &self.hover_hint_text.is_some())
             .field("interact_colors", &self.interact_colors)
             .field("editor", &self.editor)
             .field("lazy_list", &self.lazy_list)
@@ -911,10 +930,13 @@ impl Node {
                 interact: NodeInteract::default(),
                 text: None,
                 image: None,
+                placeholder_color: None,
                 window_action: None,
                 on_click: None,
                 on_right_click: None,
                 on_hover_dwell: None,
+                hover_hint: None,
+                hover_hint_text: None,
                 interact_colors: None,
                 color_bind: None,
                 editor: None,
@@ -1452,6 +1474,24 @@ impl NodeBuilder {
         F: for<'a> Fn(&mut crate::event::EventCtx<'a>) + 'static,
     {
         self.node.on_hover_dwell = Some((duration, std::rc::Rc::new(f)));
+        self
+    }
+    /// Show a small text tooltip when the pointer dwells on this node. The
+    /// engine renders the label near the node and hides it on leave —
+    /// nothing else to wire. Ideal for icon-only / collapsed controls (a
+    /// collapsed sidebar's playlist icons). See
+    /// [`crate::scene::NodeBuilderRef::hover_hint`].
+    pub fn hover_hint(mut self, text: impl Into<String>) -> Self {
+        self.node.hover_hint = Some(text.into());
+        self
+    }
+    /// Reactive variant of [`Self::hover_hint`]: the tooltip text tracks a
+    /// [`crate::signal::TextSignal`], so the label updates without a rebuild
+    /// (e.g. a like icon whose hint lists the playlists the track is in). An
+    /// empty string suppresses the tooltip. See
+    /// [`crate::scene::NodeBuilderRef::hover_hint_bind`].
+    pub fn hover_hint_bind(mut self, signal: crate::signal::TextSignal) -> Self {
+        self.node.hover_hint_text = Some(signal);
         self
     }
     pub fn build(self) -> Node {
@@ -2980,6 +3020,32 @@ impl NodeTree {
                         cover: node.image_cover,
                         clip_radius,
                     }));
+                } else if let Some(ph) = node.placeholder_color {
+                    // No resolved cover yet: paint the loading placeholder as a
+                    // rounded fill *in this same node* (same rect + radius), so
+                    // there's no separate layer behind the image to leak through
+                    // its corner once the cover loads.
+                    events.push(FlatEvent::Shape(ShapeInstance {
+                        color: ph,
+                        border_color: [0.0; 4],
+                        shadow_color: [0.0; 4],
+                        border_radius: node.style.border_radius,
+                        backdrop_uv_rect: [0.0; 4],
+                        clip_rect: clip,
+                        position: abs,
+                        size,
+                        shadow_offset: [0.0; 2],
+                        shape_kind: ShapeKind::Rect.as_u32()
+                            | ((node.style.border_sides.bits() as u32) << 8),
+                        roughness: 0.0,
+                        border_width: 0.0,
+                        shadow_blur: 0.0,
+                        shadow_opacity: 0.0,
+                        opacity,
+                        scale: node.style.scale,
+                        clip_radius,
+                        _pad1: 0.0,
+                    }));
                 }
             }
         }
@@ -2988,6 +3054,8 @@ impl NodeTree {
             || node.on_click.is_some()
             || node.on_right_click.is_some()
             || node.on_hover_dwell.is_some()
+            || node.hover_hint.is_some()
+            || node.hover_hint_text.is_some()
             || node.dismiss_transparent
             || node.on_drag.is_some()
             || node.on_wheel.is_some()

@@ -29,6 +29,10 @@ struct ExternalFrameSet {
     views: Vec<wgpu::TextureView>,
     /// Sum of frame sizes (bytes) for the memory report.
     bytes: u64,
+    /// Decode-session generation that owns these frames. A push from a newer
+    /// session clears the set first; selects from an older session are
+    /// ignored — so a previous clip's frames can never bleed into the next.
+    epoch: u64,
 }
 
 /// Owns every wgpu handle the renderer touches.
@@ -43,6 +47,11 @@ pub struct GpuContext {
     pub shape: ShapePipeline,
     pub blur: BlurResources,
     pub overdraw: OverdrawResources,
+    /// Offscreen frame target + final corner-round pass. The whole frame
+    /// composites into its texture, then one pass blits it to the swapchain
+    /// rounding the window corners — so stacked translucent layers (glass over
+    /// backdrop) round once at the corner instead of leaking per-layer.
+    pub window_round: super::window_round::WindowRound,
     /// Offscreen layer textures + the composite pipeline (compositor
     /// P2). Each layer rasterizes its instance sub-range here, then the
     /// composite pass blits all layers to the surface in z-order.
@@ -236,6 +245,7 @@ impl GpuContext {
         let shape = ShapePipeline::new(&device, format, glyph_atlas.layout(), image_atlas.layout());
         let blur = BlurResources::new(&device, width, height);
         let overdraw = OverdrawResources::new(&device, width, height, format, &shape.shape_bgl);
+        let window_round = super::window_round::WindowRound::new(&device, width, height, format);
         let timing = if want_timing {
             Some(Timing::new(&device, &queue))
         } else {
@@ -298,6 +308,7 @@ impl GpuContext {
             shape,
             blur,
             overdraw,
+            window_round,
             layers,
             layer_draws: Vec::new(),
             external_textures: std::collections::HashMap::new(),
@@ -358,6 +369,12 @@ impl GpuContext {
             self.surface_config.width,
             self.surface_config.height,
         );
+        self.window_round.resize(
+            &self.device,
+            self.surface_config.width,
+            self.surface_config.height,
+            self.surface_config.format,
+        );
         // Layer textures are physical-px sized — drop cached textures so
         // the next frame re-allocates them at the new size from the live
         // draw list (identity = surface, scroll = its content size).
@@ -395,11 +412,22 @@ impl GpuContext {
     pub fn push_external_frame(
         &mut self,
         node: crate::node::NodeId,
+        epoch: u64,
         rgba: &[u8],
         width: u32,
         height: u32,
     ) {
         debug_assert_eq!(rgba.len(), (width * height * 4) as usize);
+        // First frame of a new decode session: drop the previous clip's
+        // frames so they can never be looped into this one. Keyed by epoch,
+        // so this is correct regardless of node-id reuse or command ordering.
+        match self.external_frame_sets.get(&node) {
+            Some(set) if set.epoch != epoch => {
+                self.external_frame_sets.remove(&node);
+                self.external_textures.remove(&node);
+            }
+            _ => {}
+        }
         let size = wgpu::Extent3d {
             width,
             height,
@@ -432,6 +460,7 @@ impl GpuContext {
         );
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
         let set = self.external_frame_sets.entry(node).or_default();
+        set.epoch = epoch;
         set.bytes += (width as u64) * (height as u64) * 4;
         set.views.push(view.clone());
         set.textures.push(tex);
@@ -441,9 +470,11 @@ impl GpuContext {
 
     /// Bind `node`'s shown texture to frame `index` of its resident set.
     /// Cheap — re-binds a cached view, no pixel transfer. No-op if the node
-    /// has no set or the index is out of range.
-    pub fn select_external_frame(&mut self, node: crate::node::NodeId, index: usize) {
+    /// has no set, the index is out of range, or `epoch` doesn't match the
+    /// set's owning session (a stale select from a replaced clip).
+    pub fn select_external_frame(&mut self, node: crate::node::NodeId, epoch: u64, index: usize) {
         if let Some(set) = self.external_frame_sets.get(&node)
+            && set.epoch == epoch
             && let Some(view) = set.views.get(index)
         {
             self.external_textures.insert(node, view.clone());
@@ -461,11 +492,24 @@ impl GpuContext {
         if old == new {
             return;
         }
-        if let Some(set) = self.external_frame_sets.remove(&old) {
+        if let Some(mut set) = self.external_frame_sets.remove(&old) {
             let shown = self
                 .external_textures
                 .remove(&old)
                 .or_else(|| set.views.last().cloned());
+            // `new` may hold a set: keep it only if it belongs to the *same*
+            // decode session (a mid-build node-id reassign split this clip's
+            // frames across two ids — merge so the loop stays complete, old
+            // frames first as they're earlier in decode order). A set from a
+            // different epoch is a previous clip's leftovers — drop it so it
+            // can't bleed into this one.
+            if let Some(existing) = self.external_frame_sets.remove(&new)
+                && existing.epoch == set.epoch
+            {
+                set.bytes += existing.bytes;
+                set.views.extend(existing.views);
+                set.textures.extend(existing.textures);
+            }
             if let Some(view) = shown {
                 self.external_textures.insert(new, view);
             }
@@ -1242,11 +1286,15 @@ impl GpuContext {
                 None => CompositeBg::Slot(i),
             })
             .collect();
+        // Composite the whole frame into the offscreen target; the final
+        // window-round pass below blits it to the swapchain with rounded
+        // corners (one corner boundary over the composited result, so stacked
+        // translucent layers can't leak the back one at the arc).
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("frostify.composite pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: final_view,
+                    view: self.window_round.frame_view(),
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
@@ -1278,6 +1326,34 @@ impl GpuContext {
                 rpass.draw(0..6, 0..self.overlay_count);
                 drawcalls += 1;
             }
+        }
+        // ---- Window-round pass: offscreen frame → swapchain ------------
+        // Blit the composited frame to the surface, masking the four corners
+        // to a rounded rect once. (Overdraw mode overwrites the swapchain with
+        // its heatmap below, so this is skipped to avoid wasted work.)
+        if !self.overdraw_mode {
+            self.window_round
+                .set_uniform(&self.queue, self.window_corner_radius);
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("frostify.window_round pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: final_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rpass.set_pipeline(self.window_round.pipeline());
+            rpass.set_bind_group(0, self.window_round.bind_group(), &[]);
+            rpass.draw(0..3, 0..1);
+            drawcalls += 1;
         }
         self.last_layer_count = draws.len() as u32;
         self.last_raster_count = raster_count;

@@ -117,9 +117,15 @@ pub struct LayerDraw {
     /// screen rect. `None` for every normal layer.
     pub external: Option<crate::node::NodeId>,
     /// Corner radius (physical px) the composite rounds the clipped region
-    /// by — lets an external (video) layer honour a rounded container. 0 =
-    /// square. Only consulted for external layers.
+    /// by — lets an external (video) layer, or a promoted raster layer with
+    /// `round_rect`, honour a rounded container. 0 = square.
     pub corner_radius: f32,
+    /// `Some(rect)` (physical `[x0,y0,x1,y1]`) → round this **identity**
+    /// (full-surface) layer's composite at `rect` with `corner_radius`,
+    /// instead of compositing it square. Lets a `.layer()` card round its
+    /// *composited* result once — so stacked rounded content inside it (a
+    /// crossfade) can't leak the back layer through an anti-aliased corner.
+    pub round_rect: Option<[f32; 4]>,
     /// Composite-time edge fade `[top, right, bottom, left]` (0..1 of the
     /// rect extent on each axis) — fade alpha to 0 near those edges. Any
     /// promoted layer. All-0 = no fade.
@@ -139,6 +145,7 @@ impl Default for LayerDraw {
             window: None,
             external: None,
             corner_radius: 0.0,
+            round_rect: None,
             edge_fade: [0.0; 4],
             edge_fade_falloff: 1.0,
         }
@@ -524,6 +531,8 @@ impl LayerResources {
             // Full-surface identity (P2/P3 parity): quad = offset +
             // corner*surface*scale, uv = corner (whole texture). The
             // layer texture is surface-sized, so tex_size = surface.
+            // `round_rect` rounds the *composited* result at a sub-rect (a
+            // grouped card masked once after its content is drawn).
             None => CompositeUniform {
                 dst_origin: draw.offset,
                 dst_size: [
@@ -534,9 +543,13 @@ impl LayerResources {
                 src_extent: surface_size,
                 tex_size: surface_size,
                 surface_size,
-                clip_rect: NO_CLIP,
+                clip_rect: draw.round_rect.unwrap_or(NO_CLIP),
                 opacity: draw.opacity,
-                corner_radius: 0.0,
+                corner_radius: if draw.round_rect.is_some() {
+                    draw.corner_radius
+                } else {
+                    0.0
+                },
                 edge_fade_falloff: draw.edge_fade_falloff,
                 _pad: 0.0,
                 edge_fade: draw.edge_fade,

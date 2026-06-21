@@ -44,10 +44,22 @@ pub(crate) enum FrameCmd {
     /// Streaming: upload `frame` into the node's single reused texture.
     Frame { node: NodeId, frame: PendingFrame },
     /// Resident loop: append `frame` to the node's GPU frame set and show
-    /// it (the first-pass live build).
-    Push { node: NodeId, frame: PendingFrame },
+    /// it (the first-pass live build). `epoch` identifies the decode session
+    /// — a push with a new epoch first **clears** the node's set, so frames
+    /// from a previous clip can never accumulate into the next.
+    Push {
+        node: NodeId,
+        epoch: u64,
+        frame: PendingFrame,
+    },
     /// Resident loop: bind the node's shown texture to `index` of its set.
-    Select { node: NodeId, index: usize },
+    /// Ignored if `epoch` doesn't match the node's current set (a stale
+    /// command from a clip that's already been replaced).
+    Select {
+        node: NodeId,
+        epoch: u64,
+        index: usize,
+    },
     /// Move a node's resident frame set to a new node id (scene rebuild
     /// reassigned the `.external()` node) without re-uploading.
     Migrate { old: NodeId, new: NodeId },
@@ -87,18 +99,22 @@ impl FrameSink {
     }
 
     /// Append one frame to `node`'s resident GPU frame set (uploaded once)
-    /// and show it. Used for each frame of the first decode pass.
-    pub fn push_frame(&self, node: NodeId, width: u32, height: u32, rgba: Vec<u8>) {
+    /// and show it. Used for each frame of the first decode pass. `epoch`
+    /// tags the decode session: the first push of a new epoch clears any
+    /// frames left over from the previous clip on that node.
+    pub fn push_frame(&self, node: NodeId, epoch: u64, width: u32, height: u32, rgba: Vec<u8>) {
         self.push_cmd(FrameCmd::Push {
             node,
+            epoch,
             frame: PendingFrame { width, height, rgba },
         });
     }
 
     /// Show frame `index` of `node`'s resident set. Cheap — re-binds a
-    /// texture view, no pixel transfer. Out-of-range indices are ignored.
-    pub fn select(&self, node: NodeId, index: usize) {
-        self.push_cmd(FrameCmd::Select { node, index });
+    /// texture view, no pixel transfer. Out-of-range indices are ignored, as
+    /// are commands whose `epoch` doesn't match the node's current set.
+    pub fn select(&self, node: NodeId, epoch: u64, index: usize) {
+        self.push_cmd(FrameCmd::Select { node, epoch, index });
     }
 
     /// Move `old`'s resident frame set to `new` (a rebuild reassigned the
