@@ -97,6 +97,10 @@ pub struct AppConfig {
     /// (default) leaves winit to fall back to the embedded executable
     /// icon. Set via [`App::window_icon_rgba`].
     pub window_icon: Option<(u32, u32, Vec<u8>)>,
+    /// CPU-rendered startup splash shown while the GPU back-end loads.
+    /// `None` (default) shows nothing. Set via [`App::splash`]. See
+    /// [`crate::splash`] for the cold-start gap it fills.
+    pub splash: Option<crate::splash::SplashConfig>,
 }
 
 impl AppConfig {
@@ -111,6 +115,7 @@ impl AppConfig {
             capture_dir: PathBuf::from("debug_captures"),
             window_corner_radius: 0.0,
             window_icon: None,
+            splash: None,
         }
     }
 }
@@ -782,6 +787,16 @@ impl App {
     /// `width * height * 4` (handled at window creation).
     pub fn window_icon_rgba(mut self, width: u32, height: u32, rgba: Vec<u8>) -> Self {
         self.config.window_icon = Some((width, height, rgba));
+        self
+    }
+
+    /// Configure a CPU-rendered startup splash (logo mark + wordmark)
+    /// shown while the GPU back-end loads — the canonical fix for the
+    /// blank ~2 s cold-start gap on Windows. Painted entirely on the CPU
+    /// before the blocking GPU init, so the window appears sooner, not
+    /// later. See [`crate::splash`].
+    pub fn splash(mut self, cfg: crate::splash::SplashConfig) -> Self {
+        self.config.splash = Some(cfg);
         self
     }
 
@@ -3805,6 +3820,53 @@ impl ApplicationHandler for App {
             (phys.width as f32 / s).round() as u32,
             (phys.height as f32 / s).round() as u32,
         ];
+
+        // CPU splash: paint the logo + wordmark and show it *before* the
+        // blocking `GpuContext::new` below. On a cold start the GPU
+        // back-end (d3d12 / dxgi + the driver UMD) can take ~2 s to load,
+        // during which the window is still hidden — without this the user
+        // stares at nothing. The bitmap build is a few ms and runs ahead
+        // of that 2 s, so the first pixels appear *sooner*, never later.
+        // Skipped in headless capture mode. Torn down once the real
+        // window is visible (after the first GPU frame, below).
+        let splash = if self.capture_frames.is_none() {
+            let scale_factor = self.scale_factor;
+            let fallback = self.logical_size;
+            let text = &mut self.ctx.text;
+            self.config.splash.clone().and_then(|cfg| {
+                let bmp = crate::splash::SplashBitmap::build(&cfg, text, scale_factor)?;
+                // Center on the monitor the real window opened on.
+                let mon = window_arc
+                    .current_monitor()
+                    .or_else(|| event_loop.primary_monitor());
+                let (mx, my, mw, mh) = match mon.as_ref() {
+                    Some(m) => {
+                        let p = m.position();
+                        let sz = m.size();
+                        (p.x, p.y, sz.width as i32, sz.height as i32)
+                    }
+                    None => (0, 0, fallback[0] as i32, fallback[1] as i32),
+                };
+                let x = mx + (mw - bmp.w as i32) / 2;
+                let y = my + (mh - bmp.h as i32) / 2;
+                #[cfg(windows)]
+                {
+                    let _ = (&cfg, &mon);
+                    crate::splash::Splash::show(&bmp, x, y)
+                }
+                #[cfg(not(windows))]
+                {
+                    let dpi = mon
+                        .as_ref()
+                        .map(|m| m.scale_factor())
+                        .unwrap_or(scale_factor as f64);
+                    crate::splash::Splash::show(event_loop, &cfg, &bmp, x, y, dpi)
+                }
+            })
+        } else {
+            None
+        };
+
         self.gpu = Some(GpuContext::new(Arc::clone(&window_arc)));
         // Apply the configured window-corner radius — suppressed while
         // maximised so the radius doesn't clip against the work-area
@@ -3849,6 +3911,10 @@ impl ApplicationHandler for App {
         if let Some(w) = &self.window {
             w.set_visible(true);
             w.request_redraw();
+        }
+        // Real window is up with its first frame — remove the splash.
+        if let Some(splash) = splash {
+            splash.close();
         }
 
         // Deferred autocapture: arm a deadline + let the loop run

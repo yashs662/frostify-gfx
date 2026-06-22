@@ -49,6 +49,7 @@ pub mod overlay;
 pub mod reactive;
 pub mod scene;
 pub mod signal;
+pub mod splash;
 pub mod svg;
 pub mod text;
 pub mod uploader;
@@ -100,6 +101,7 @@ pub use scene::{
     WidthPctBindSlot, WidthPxBindSlot,
 };
 pub use signal::{Signal, TextSignal};
+pub use splash::{Splash, SplashBitmap, SplashConfig};
 pub use winit::window::CursorIcon;
 pub use svg::{rasterize_svg, rasterize_svg_to};
 pub use text::{RasterizedGlyph, ShapedGlyph, TextMetrics, TextResources};

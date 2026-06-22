@@ -25,6 +25,20 @@ resvg = "0.45"
 tiny-skia = "0.11"
 arboard = "3"
 
+# Startup splash (see src/splash.rs). Windows uses a layered window for
+# true per-pixel alpha via the Win32 API; other platforms present an
+# opaque panel via softbuffer.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_LibraryLoader",
+] }
+
+[target.'cfg(not(windows))'.dependencies]
+softbuffer = "0.4"
+
 [[example]]
 name = "hello_window"
 path = "examples/hello_window.rs"
@@ -64,3 +78,7 @@ path = "examples/modal.rs"
 [[example]]
 name = "drag_drop"
 path = "examples/drag_drop.rs"
+
+[[example]]
+name = "splash_preview"
+path = "examples/splash_preview.rs"
